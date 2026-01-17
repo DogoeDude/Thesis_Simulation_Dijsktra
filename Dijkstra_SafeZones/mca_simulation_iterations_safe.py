@@ -944,7 +944,7 @@ def main():
     # SAVE
     import os
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    filename = os.path.join(script_dir, "simulation_results_safe_final.xlsx")
+    filename = os.path.join(script_dir, "simulation_results_dijkstra_2.xlsx")
     
     try:
         # STYLING

@@ -671,76 +671,80 @@ class MCASimulation:
 
     def recalculate_dynamic_paths(self):
         """
-        Re-calculates Dijkstra fields based on current congestion levels.
-        This prevents 'Winner Takes All' behavior by penalizing crowded paths.
+        DYNAMIC REVERSE DIJKSTRA UPDATE (Section 3.3.6 & 3.3.7)
+        
+        Logic:
+        1. Calculate Penalty Field (C_cell) for every cell based on Hazards/Congestion.
+           Equation 3-8: C_cell = alpha * rho + beta * F + ...
+        2. Update Graph Edge Weights to reflect 'Effective Traversal Cost'.
+           Cost = Distance / (1 - C_cell)
+        3. Re-run Reverse Dijkstra from Exits to propagate new costs.
+        4. Update Flow Directions for agents to follow.
         """
-        # 1. Update Edge Weights (Congestion Penalty)
-        # Cost = Distance * (1 + alpha * (rho / rho_max))
-        ALPHA = 5.0 # Tunable penalty factor
+        if self.time_step % 10 != 0: return # Update every 10 steps (approx 3-7s as per paper)
+
+        # 1. Update Penalties (C_cell)
+        # Parameters (Equation 3-8)
+        ALPHA = 1.0 # Density Weight
+        # Future: BETA (Fire), GAMMA (Smoke), etc.
+        
+        current_penalties = {}
+        
+        for cid, count in self.population.items():
+            if cid not in self.road_cells['id'].values: continue
+            
+            # Density
+            area = self.cell_areas.get(cid, 60.0)
+            cap = self.max_capacities.get(cid, area * self.RHO_MAX)
+            # Physical Density Ratio (0 to 1.0+)
+            rho_norm = (count / cap) if cap > 0 else 0
+            
+            # C_cell Formula
+            # Clamp to 0.95 to prevent division by zero in cost calculation
+            c_cell = min(0.95, ALPHA * rho_norm)
+            
+            # Store
+            self.penalties[cid] = c_cell
+            current_penalties[cid] = c_cell
+
+        # 2. Update Graph Weights (Effective Traversal Cost)
+        # We need to update the weights of edges pointing TO this cell (or bidirectional).
+        # Since it's an undirected graph in NetworkX (usually), we update edge attributes.
         
         for u, v in self.graph.edges():
-            # Geometric Distance (Base Cost)
-            p1 = self.cell_centroids.get(u)
-            p2 = self.cell_centroids.get(v)
-            base_dist = p1.distance(p2) if (p1 and p2) else 1.0
+            # Get geometry distance (static)
+            # We assume initial weight was distance.
+            # If not stored, we re-calc or just assume 6.0m (Cell Height) / 10.0m.
+            # Let's use the 'weight' attribute if exists, else euclidean.
             
-            # Congestion Factor
-            pop_u = self.population.get(u, 0)
-            pop_v = self.population.get(v, 0)
+            # Determine Penalty for this edge.
+            # Agents move U -> V. The cost depends on entering V?
+            # Standard Dijkstra: Cost to traverse edge (u,v).
+            # If V is congested, cost to enter V is high.
+            # If U is congested, moving out is slow? 
+            # Usually Node Weight. We apply max(p_u, p_v).
             
-            area_u = self.cell_areas.get(u, 60.0)
-            area_v = self.cell_areas.get(v, 60.0)
+            p_u = current_penalties.get(u, 0)
+            p_v = current_penalties.get(v, 0)
+            p_edge = max(p_u, p_v)
             
-            rho_u = pop_u / area_u if area_u > 0 else 0
-            rho_v = pop_v / area_v if area_v > 0 else 0
-            avg_rho = (rho_u + rho_v) / 2.0
+            # Base Distance (Geometry)
+            # We can retrieve original length if we stored it, or approx.
+            # For exactness, let's calc geometry if needed, or assume unit graph if unweighted.
+            # Our graph construction didn't explicitly set weights, so it defaults to 1?
+            # So Base Cost = 1.
             
-            # Penalty
-            # If avg_rho = 5.0 (Max), penalty = 1 + 5*(1.0) = 6x cost
-            congestion_factor = 1.0 + ALPHA * (min(avg_rho, self.RHO_MAX) / self.RHO_MAX)
+            base_cost = 1.0
             
-            new_weight = base_dist * congestion_factor
+            # Cost Formula: Cost = Base / (1 - P)
+            # If P=0, Cost=1. If P=0.5, Cost=2. If P=0.9, Cost=10.
+            new_weight = base_cost / (1.0 - p_edge)
+            
             self.graph[u][v]['weight'] = new_weight
-            
-        # 2. Re-Compute Fields
-        # A. Safe Zone Field
-        if self.safe_zones is not None:
-             valid_safe = list(self.safe_zone_cells)
-             self.dijkstra_distances, _ = Dijkstra.calculate_dijkstra_field(self.graph, valid_safe)
-        
-        # B. Exit Field (Fallback)
-        self.dist_to_exit, _ = Dijkstra.calculate_dijkstra_field(self.graph, self.exits_ids)
-        
-        # 3. Re-Assign Directions (Gradient Descent)
-        for node in self.graph.nodes:
-            if node in self.exits_ids:
-                self.directions[node] = None
-                continue
-                
-            # Hybrid Logic
-            d_safe = self.dijkstra_distances.get(node, float('inf'))
-            if d_safe != float('inf'):
-                 source_field = self.dijkstra_distances
-            else:
-                 source_field = self.dist_to_exit
-            
-            min_dist = source_field.get(node, float('inf'))
-            current_best = min_dist
-            best_neighbor = None
-            
-            for neighbor in self.graph.neighbors(node):
-                d = source_field.get(neighbor, float('inf'))
-                if d < current_best:
-                    current_best = d
-                    best_neighbor = neighbor
-            
-            self.directions[node] = best_neighbor
-            
-        # 4. Re-Apply Safe Zone Overrides (Preserve Tunnels)
-        if hasattr(self, 'safe_path_nodes'):
-            for path in self.safe_path_nodes:
-                for i in range(len(path) - 1):
-                    self.directions[path[i]] = path[i+1]
+        # 3. Re-run Reverse Dijkstra (Global Update)
+        # This calls the main routing logic which uses the updated graph weights
+        self.compute_flow_directions()
+
 
     def step(self):
         # DYNAMIC RE-ROUTING (Every 50 steps)
@@ -814,7 +818,7 @@ class MCASimulation:
         self.time_step += 1
         return sum(self.population.values())
 
-    def export_to_excel(self, filename="simulation_results_safe_1.xlsx"):
+    def export_to_excel(self, filename="simulation_results_dijkstra_1.xlsx"):
         print(f"Exporting results to {filename}...")
         
         time_data = []
@@ -969,7 +973,7 @@ class MCASimulation:
         # Export Data
         import os
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        self.export_to_excel(filename=os.path.join(script_dir, "simulation_results_safe_1.xlsx"))
+        self.export_to_excel(filename=os.path.join(script_dir, "simulation_results_dijkstra_1.xlsx"))
                 
     def animate_results(self):
         print("Preparing animation...")

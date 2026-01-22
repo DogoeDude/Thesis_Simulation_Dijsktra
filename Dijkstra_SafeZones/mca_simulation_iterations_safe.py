@@ -666,7 +666,7 @@ class MCASimulation:
         
         self.casualties += total_deaths_this_step
 
-        self.casualties += total_deaths_this_step
+
 
         # 1.5 HAZARD-AWARE REROUTE CHECK
         # --------------------------------------------------------

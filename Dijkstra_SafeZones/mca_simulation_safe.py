@@ -832,6 +832,7 @@ class MCASimulation:
 
         new_population = self.population.copy()
         current_step_flows = {} # (u, v) -> count
+        step_exit_flow = {} # NEW: Buffer for exit usage
         total_deaths_this_step = 0
         
         # 1. Check for Stampedes
@@ -1063,7 +1064,7 @@ class MCASimulation:
                          actual_out = min(new_population[cid], flow_out)
                          
                          new_population[cid] = max(0, new_population[cid] - actual_out)
-                         self.exit_usage[exit_id] += actual_out
+                         step_exit_flow[exit_id] = step_exit_flow.get(exit_id, 0) + actual_out
                      else:
                          # LOCAL MINIMUM -> Stuck
                          # Agents remain here. do nothing.
@@ -1110,6 +1111,10 @@ class MCASimulation:
             # Log Flow
             if actual_flow > 0:
                 current_step_flows[(cid, target_id)] = current_step_flows.get((cid, target_id), 0) + actual_flow
+
+        # Commit buffered exit flow
+        for eid, count in step_exit_flow.items():
+            self.exit_usage[eid] += count
 
         self.population = new_population
         self.flow_history.append(current_step_flows)
@@ -1465,8 +1470,11 @@ class MCASimulation:
 
         def update_selection_text(frame_idx):
             # Correct for Phase 1 Offset
-            # Correct for Phase 1 Offset
             sim_frame = frame_idx
+            if hasattr(self, 'dijkstra_history'):
+                 sim_frame = frame_idx - len(self.dijkstra_history)
+            
+            if sim_frame < 0: sim_frame = 0
             if sim_frame >= len(self.history):
                  sim_frame = len(self.history) - 1
 

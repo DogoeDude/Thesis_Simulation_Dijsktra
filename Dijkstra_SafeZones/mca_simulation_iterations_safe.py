@@ -645,6 +645,7 @@ class MCASimulation:
 
 
         new_population = self.population.copy()
+        step_exit_flow = {} # NEW: Buffer for exit usage
         total_deaths_this_step = 0
         
         # 1. Check for Stampedes (Apply Grace Period of 10 steps)
@@ -815,7 +816,7 @@ class MCASimulation:
                          actual_out = min(new_population[cid], flow_out)
                          
                          new_population[cid] = max(0, new_population[cid] - actual_out)
-                         self.exit_usage[exit_id] += actual_out
+                         step_exit_flow[exit_id] = step_exit_flow.get(exit_id, 0) + actual_out
                      else:
                          # LOCAL MINIMUM -> Stuck
                          # Agents remain here. do nothing.
@@ -845,6 +846,10 @@ class MCASimulation:
             
             new_population[cid] -= actual_flow
             new_population[target_id] += actual_flow
+            
+        # Commit buffered exit flow
+        for eid, count in step_exit_flow.items():
+            self.exit_usage[eid] += count
             
         self.population = new_population
         self.time_step += 1

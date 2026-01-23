@@ -581,13 +581,13 @@ class MCASimulation:
                 
             time_data.append({
                 'Time (s)': t * self.DT,
-                'Exit Flow Rate': int(flow_step), # Round to int
-                'Remaining Evacuees': int(total_alive), # Round to int
+                'Exit Flow Rate': int(flow_step), # Flow is usually discrete count, but ok to keep int or float. request was casualties/remaining.
+                'Remaining Evacuees': total_alive,
                 'Density Evolution': avg_density,
                 'Velocity of Evacuees': avg_speed,
                 # Extra internal metrics kept for utility but renamed if needed
                 'Peak Density': max_rho, 
-                'Cumulative Casualties': int(cas_count) # Round to int
+                'Cumulative Casualties': cas_count
             })
             
         df_time = pd.DataFrame(time_data)
@@ -601,7 +601,7 @@ class MCASimulation:
             
             cell_data.append({
                 'Cell ID': cid,
-                'Spatial Distribution (Casualties)': int(final_deaths), # Round to int
+                'Spatial Distribution (Casualties)': final_deaths,
                 'Area': area,
                 'Status': 'BLOCKED' if cid in self.blocked_cells else 'OPEN'
             })
@@ -630,9 +630,9 @@ class MCASimulation:
         
         df_summary = pd.DataFrame([{
             'Total Evacuation Time': final_time,
-            'Total Casualties': int(self.casualties), # Round to int
+            'Total Casualties': self.casualties,
             'Total Evacuated': int(sum(self.exit_usage.values())),
-            'Remaining Agents': int(sum(self.history[-1].values()))
+            'Remaining Agents': sum(self.history[-1].values())
         }])
 
         # WRITE TO EXCEL
@@ -686,6 +686,11 @@ class MCASimulation:
         # But run() relies on init.
         # Let's trust initialize_population to do the reset before run.
         
+        # Log Initial State (Step 0)
+        initial_pop = sum(self.population.values())
+        initial_evac = sum(self.exit_usage.values())
+        print(f"Step 0 (Start): Agents: {initial_pop:.0f} | Evacuated: {initial_evac:.0f} | Dead: {self.casualties:.0f}")
+
         for t in range(steps):
             total = self.step()
             self.history.append(self.population.copy())
@@ -693,8 +698,9 @@ class MCASimulation:
             self.per_cell_casualty_history.append(self.casualties_per_cell.copy())
             self.exit_usage_history.append(self.exit_usage.copy())
             
-            if t % 10 == 0:
-                print(f"Step {t}: Agents: {total:.0f} | Dead: {self.casualties:.0f}")
+            if (t + 1) % 10 == 0:
+                curr_evac = sum(self.exit_usage.values())
+                print(f"Step {t+1}: Agents: {total:.0f} | Evacuated: {curr_evac:.0f} | Dead: {self.casualties:.0f}")
             if total < 1:
                 break
         

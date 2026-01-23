@@ -398,6 +398,41 @@ class MCASimulation:
             d, v = Dijkstra.calculate_dijkstra_field(self.graph, nodes)
             self.exit_fields[fid] = {'distances': d, 'visited': v}
             
+        # ------------------------------------------------------------------------
+        # NEW: MANY-TO-MANY CONNECTIVITY ENUMERATION (For Visualization Only)
+        # ------------------------------------------------------------------------
+        self.exit_safezone_paths = {fid: {} for fid in fid_exits}
+        for fid, field_data in self.exit_fields.items():
+            dist_map = field_data['distances']
+            target_exits = fid_exits[fid]
+            
+            for sz in valid_safe:
+                d_sz = dist_map.get(sz, float('inf'))
+                if d_sz == float('inf'): continue
+                
+                # Trace path sz -> exit fid (Gradient Descent)
+                path = [sz]
+                curr = sz
+                while curr not in target_exits:
+                    best_n = None
+                    best_d = dist_map.get(curr, float('inf'))
+                    for n in self.graph.neighbors(curr):
+                        d_n = dist_map.get(n, float('inf'))
+                        if d_n < best_d:
+                            best_d = d_n
+                            best_n = n
+                    if best_n is None: break
+                    curr = best_n
+                    path.append(curr)
+                
+                if path[-1] in target_exits:
+                    coords = []
+                    for n in path:
+                        if n in self.cell_centroids:
+                            pt = self.cell_centroids[n]
+                            coords.append((pt.x, pt.y))
+                    self.exit_safezone_paths[fid][sz] = coords
+            
         # 3. Create Composite "Nearest Exit" Field (for general visualization logic)
         self.dist_to_exit = {}
         all_visited = [] # Flattened for Phase 1 animation if needed
@@ -416,46 +451,30 @@ class MCASimulation:
         raw_visited_1 = all_visited # Keep compatible var name
 
         # ------------------------------------------------------------------------
-        # TRACE PATHS & ASSIGN SAFE ZONES (FORCED LOAD BALANCING)
+        # TRACE PATHS & ASSIGN SAFE ZONES (DISTANCE-OPTIMAL ASSIGNMENT)
         # ------------------------------------------------------------------------
         self.safe_paths = []
         self.safe_path_nodes = []
-        print("\n=== SAFE ZONE ASSIGNMENT (ROUND ROBIN BALANCING) ===")
+        print("\n=== SAFE ZONE ASSIGNMENT (DISTANCE-OPTIMAL) ===")
         
-        # Keep track of assignments for balancing
+        # Keep track of assignments for emergent distribution monitoring
         exit_counts = {fid: 0 for fid in fid_exits}
-        available_fids = sorted(list(fid_exits.keys())) # Ensure deterministic order
         
-        for i, sz in enumerate(valid_safe):
-            # Round Robin Selection: Cycle through available FIDs
-            # But only accept if reachable (dist != inf)
+        for sz in valid_safe:
+            # DISTANCE-OPTIMAL: Evaluate all Dijkstra fields and pick the nearest reachable exit
+            best_fid = None
+            best_dist = float('inf')
             
-            assigned_fid = None
-            assigned_dist = float('inf')
-            
-            # Try to assign to the "Next" FID in sequence
-            start_index = i % len(available_fids)
-            
-            # Check FIDs starting from the round-robin index, wrapping around
-            for offset in range(len(available_fids)):
-                idx = (start_index + offset) % len(available_fids)
-                fid = available_fids[idx]
-                
-                data = self.exit_fields[fid]
+            for fid, data in self.exit_fields.items():
                 d = data['distances'].get(sz, float('inf'))
-                
-                if d != float('inf'):
-                    assigned_fid = fid
-                    assigned_dist = d
-                    break # Found a valid exit for this turn
+                if d < best_dist:
+                    best_dist = d
+                    best_fid = fid
             
-            if assigned_fid is None:
+            if best_fid is None:
                 print(f"  ⚠️ SZ {sz} -> Unreachable from ANY exit!")
                 continue
                 
-            best_fid = assigned_fid # Use the forced assignment
-            best_dist = assigned_dist
-            
             exit_counts[best_fid] += 1
             
             # TRACE PATH using the SPECIFIC FIELD of best_fid
@@ -1167,11 +1186,11 @@ class MCASimulation:
             time_data.append({
                 'Time (s)': t * self.DT,
                 'Exit Flow Rate': int(flow_step),
-                'Remaining Evacuees': int(total_alive),
+                'Remaining Evacuees': total_alive,
                 'Density Evolution': avg_density,
                 'Velocity of Evacuees': avg_speed,
                 'Peak Density': max_rho, 
-                'Cumulative Casualties': int(cas_count)
+                'Cumulative Casualties': cas_count
             })
             
             # Add Penalty Stats if available
@@ -1209,7 +1228,7 @@ class MCASimulation:
             
             cell_data.append({
                 'Cell ID': cid,
-                'Spatial Distribution (Casualties)': int(final_deaths),
+                'Spatial Distribution (Casualties)': final_deaths,
                 'Area': area,
                 'Status': 'BLOCKED' if cid in self.blocked_cells else 'OPEN'
             })
@@ -1234,9 +1253,9 @@ class MCASimulation:
         
         df_summary = pd.DataFrame([{
             'Total Evacuation Time': final_time,
-            'Total Casualties': int(self.casualties), # Round to int
+            'Total Casualties': self.casualties,
             'Total Evacuated': int(sum(self.exit_usage.values())),
-            'Remaining Agents': int(sum(self.history[-1].values()))
+            'Remaining Agents': sum(self.history[-1].values())
         }])
 
         try:
@@ -1311,6 +1330,11 @@ class MCASimulation:
         else:
              print("!!! WARNING: No valid fire locations found! Fire will NOT start. Check distance map.")
         
+        # Log Initial State (Step 0)
+        initial_pop = sum(self.population.values())
+        initial_evac = sum(self.exit_usage.values())
+        print(f"Step 0 (Start): Agents: {initial_pop:.0f} | Evacuated: {initial_evac:.0f} | Dead: {self.casualties:.0f}")
+
         for t in range(steps):
             # INJECT HAZARD (RANDOMIZED)
             if t == fire_start_time:
@@ -1340,8 +1364,9 @@ class MCASimulation:
             # 500 steps * 300 cells * float = Small.
             self.distance_history.append(self.dijkstra_distances.copy())
             
-            if t % 10 == 0:
-                print(f"Step {t}: Agents: {total:.0f} | Dead: {self.casualties:.0f}")
+            if (t + 1) % 10 == 0:
+                curr_evac = sum(self.exit_usage.values())
+                print(f"Step {t+1}: Agents: {total:.0f} | Evacuated: {curr_evac:.0f} | Dead: {self.casualties:.0f}")
             if total < 1:
                 break
         
@@ -1461,6 +1486,10 @@ class MCASimulation:
         from matplotlib.collections import LineCollection
         self.lc_safe_paths = LineCollection([], colors='yellow', linestyles='dashed', linewidths=2.5, zorder=20, alpha=0.8)
         ax.add_collection(self.lc_safe_paths) 
+        
+        # NEW: Connectivity Visibility Layer (Gray Dotted Lines)
+        self.lc_connectivity_paths = LineCollection([], colors='gray', linestyles='dotted', linewidths=1.0, zorder=19, alpha=0.4)
+        ax.add_collection(self.lc_connectivity_paths)
         
         # Visualization for Casualties (Markers)
         # We use a scatter plot to show 'X' marks where deaths occur
@@ -1642,11 +1671,18 @@ class MCASimulation:
                 return collection, info_text
 
             # --- PHASE 2: EVACUATION ---
-            if hasattr(self, 'lc_safe_paths') and hasattr(self, 'safe_paths'):
-                 if self.view_mode == 'dijkstra':
-                     self.lc_safe_paths.set_segments(self.safe_paths)
-                 else:
-                     self.lc_safe_paths.set_segments([])
+            # Hide safe zone paths in Dijkstra mode (keep it clean like Pure version)
+            if hasattr(self, 'lc_safe_paths'):
+                if self.view_mode == 'dijkstra':
+                    self.lc_safe_paths.set_segments([])
+                else:
+                    # Only show in other modes if needed
+                    self.lc_safe_paths.set_segments([])
+
+            # --- NEW: UPDATE CONNECTIVITY VISIBILITY ---
+            # Hide these paths to keep visualization clean like Pure version
+            if hasattr(self, 'lc_connectivity_paths'):
+                self.lc_connectivity_paths.set_segments([])
 
             # Correct frame mapping
             sim_frame = frame
@@ -1708,22 +1744,17 @@ class MCASimulation:
                  else:
                      self.quiver = None
  
-            # 3. STATIC/DYNAMIC DIJKSTRA FIELD
+            # 2. DIJKSTRA STATIC FIELD (Ported from Pure)
             elif self.view_mode == 'dijkstra':
-                 ax.set_title(f"Dynamic Dijkstra Field (Time: {sim_frame}s)", fontsize=14, fontweight='bold')
+                 ax.set_title("Static Dijkstra Field (Heatmap: Distance | Arrows: Gradient)", fontsize=14, fontweight='bold')
                  self.scat_casualties.set_visible(False)
                  self.scat_penalties.set_visible(False)
                  
-                 # Fetch Historical Map
-                 d_map = self.dijkstra_distances
-                 if sim_frame is not None and sim_frame < len(self.distance_history):
-                     d_map = self.distance_history[sim_frame]
-                 
-                 # Show Distance Map
+                 # Show Distance Map (STATIC - not time-varying)
                  d_vals = []
                  max_d = 0
                  for idx in self.road_cells['id']:
-                      d = d_map.get(idx, float('inf'))
+                      d = self.dijkstra_distances.get(idx, float('inf'))
                       if d != float('inf'): max_d = max(max_d, d)
                       d_vals.append(d)
                  
@@ -1736,34 +1767,27 @@ class MCASimulation:
                          norm_vals.append(val)
                  
                  collection.set_array(np.array(norm_vals))
-                 
-                 # COLOR CYCLING: Change theme every 100s to show "New Phase"
-                 cycle_idx = int(sim_frame // 100)
-                 cmaps = ['magma', 'viridis', 'plasma', 'cividis', 'inferno']
-                 acc_cmap = cmaps[cycle_idx % len(cmaps)]
-                 
-                 collection.set_cmap(acc_cmap) 
+                 collection.set_cmap('magma') 
                  collection.set_clim(0, 1.0)
-                 collection.changed() # FORCE UPDATE
-                 
-                 ax.set_title(f"Dynamic Dijkstra Field (Time: {sim_frame}s) | Phase {cycle_idx} ({acc_cmap})", fontsize=14, fontweight='bold')
                  
                  if self.quiver: 
                      self.quiver.remove()
                  
-                 # DYNAMIC ARROWS: Compute new Flow Direction based on d_map
+                 # STATIC GLOBAL FLOW ARROWS - Shows gradient direction for ALL cells
                  xq, yq, uq, vq = [], [], [], []
-                 
-                 # Use Flow Vectors if available, else Dynamic
-                 for idx in self.graph.nodes:
-                     if idx in self.flow_vectors and self.flow_vectors[idx] != (0,0):
-                         c = self.cell_centroids.get(idx)
-                         v = self.flow_vectors[idx]
-                         xq.append(c.x); yq.append(c.y)
-                         uq.append(v[0]); vq.append(v[1])
+                 for idx, (u, v) in self.global_flow_vectors.items():
+                     centroid = self.cell_centroids.get(idx)
+                     if centroid and (u != 0 or v != 0):
+                         xq.append(centroid.x)
+                         yq.append(centroid.y)
+                         uq.append(u)
+                         vq.append(v)
                  
                  if xq:
-                     self.quiver = ax.quiver(xq, yq, uq, vq, scale=30, width=0.003, color='black', alpha=0.6, zorder=6)
+                     # White arrows for visibility on Magma
+                     # DISABLED PER USER FEEDBACK ("White Lines")
+                     # self.quiver = ax.quiver(xq, yq, uq, vq, scale=30, width=0.003, color='white', alpha=0.5, zorder=6)
+                     self.quiver = None
                  else:
                      self.quiver = None
 

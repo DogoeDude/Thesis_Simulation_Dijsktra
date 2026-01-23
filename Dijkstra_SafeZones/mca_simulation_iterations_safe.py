@@ -367,6 +367,41 @@ class MCASimulation:
             d, v = Dijkstra.calculate_dijkstra_field(self.graph, nodes)
             self.exit_fields[fid] = {'distances': d, 'visited': v}
             
+        # ------------------------------------------------------------------------
+        # NEW: MANY-TO-MANY CONNECTIVITY ENUMERATION (For Visualization Only)
+        # ------------------------------------------------------------------------
+        self.exit_safezone_paths = {fid: {} for fid in fid_exits}
+        for fid, field_data in self.exit_fields.items():
+            dist_map = field_data['distances']
+            target_exits = fid_exits[fid]
+            
+            for sz in valid_safe:
+                d_sz = dist_map.get(sz, float('inf'))
+                if d_sz == float('inf'): continue
+                
+                # Trace path sz -> exit fid (Gradient Descent)
+                path = [sz]
+                curr = sz
+                while curr not in target_exits:
+                    best_n = None
+                    best_d = dist_map.get(curr, float('inf'))
+                    for n in self.graph.neighbors(curr):
+                        d_n = dist_map.get(n, float('inf'))
+                        if d_n < best_d:
+                            best_d = d_n
+                            best_n = n
+                    if best_n is None: break
+                    curr = best_n
+                    path.append(curr)
+                
+                if path[-1] in target_exits:
+                    coords = []
+                    for n in path:
+                        if n in self.cell_centroids:
+                            pt = self.cell_centroids[n]
+                            coords.append((pt.x, pt.y))
+                    self.exit_safezone_paths[fid][sz] = coords
+            
         self.dist_to_exit = {}
         all_visited = [] 
         
@@ -379,39 +414,30 @@ class MCASimulation:
                     self.dist_to_exit[n] = dist
         
         # ------------------------------------------------------------------------
-        # TRACE PATHS & ASSIGN SAFE ZONES (FORCED LOAD BALANCING)
+        # TRACE PATHS & ASSIGN SAFE ZONES (DISTANCE-OPTIMAL ASSIGNMENT)
         # ------------------------------------------------------------------------
         self.safe_paths = []
         self.safe_path_nodes = []
-        print("\n=== SAFE ZONE ASSIGNMENT (ROUND ROBIN BALANCING) ===")
+        print("\n=== SAFE ZONE ASSIGNMENT (DISTANCE-OPTIMAL) ===")
         
+        # Keep track of assignments for emergent distribution monitoring
         exit_counts = {fid: 0 for fid in fid_exits}
-        available_fids = sorted(list(fid_exits.keys()))
         
-        for i, sz in enumerate(valid_safe):
-            assigned_fid = None
-            assigned_dist = float('inf')
+        for sz in valid_safe:
+            # DISTANCE-OPTIMAL: Evaluate all Dijkstra fields and pick the nearest reachable exit
+            best_fid = None
+            best_dist = float('inf')
             
-            start_index = i % len(available_fids)
-            
-            for offset in range(len(available_fids)):
-                idx = (start_index + offset) % len(available_fids)
-                fid = available_fids[idx]
-                
-                data = self.exit_fields[fid]
+            for fid, data in self.exit_fields.items():
                 d = data['distances'].get(sz, float('inf'))
-                
-                if d != float('inf'):
-                    assigned_fid = fid
-                    assigned_dist = d
-                    break 
+                if d < best_dist:
+                    best_dist = d
+                    best_fid = fid
             
-            if assigned_fid is None:
+            if best_fid is None:
                 print(f"  ⚠️ SZ {sz} -> Unreachable from ANY exit!")
                 continue
                 
-            best_fid = assigned_fid
-            best_dist = assigned_dist
             exit_counts[best_fid] += 1
             
             # TRACE PATH
@@ -442,7 +468,7 @@ class MCASimulation:
             
             if len(path) > 1 and path[-1] in target_exits:
                  self.safe_path_nodes.append(path)
-                 print(f"  SZ {sz} -> FORCED to Exit FID {best_fid} (Dist: {best_dist:.1f}m)")
+                 print(f"  SZ {sz} -> Assigned to Exit FID {best_fid} (Shortest Dist: {best_dist:.1f}m)")
             else:
                  print(f"  ⚠️ SZ {sz} -> Path Trace Failed for FID {best_fid}")
 
@@ -880,6 +906,11 @@ class MCASimulation:
         else:
              print("!!! WARNING: No valid fire locations found! Fire will NOT start. Check distance map.")
 
+        # Log Initial State (Step 0)
+        initial_pop = sum(self.population.values())
+        initial_evac = sum(self.exit_usage.values())
+        print(f"Step 0 (Start): Agents: {initial_pop:.0f} | Evacuated: {initial_evac:.0f} | Dead: {self.casualties:.0f}")
+
         for t in range(steps):
             # INJECT HAZARD (RANDOMIZED)
             if t == fire_start_time:
@@ -894,8 +925,9 @@ class MCASimulation:
             self.per_cell_casualty_history.append(self.casualties_per_cell.copy())
             self.exit_usage_history.append(self.exit_usage.copy())
             
-            if t % 50 == 0:
-                print(f"Step {t}: Agents: {total:.0f} | Dead: {self.casualties:.0f}")
+            if (t + 1) % 10 == 0:
+                curr_evac = sum(self.exit_usage.values())
+                print(f"Step {t+1}: Agents: {total:.0f} | Evacuated: {curr_evac:.0f} | Dead: {self.casualties:.0f}")
             if total < 1:
                 break
         
@@ -973,7 +1005,7 @@ class MCASimulation:
             time_data.append({
                 'Time (s)': t * self.DT,
                 'Exit Flow Rate': int(flow_step), 
-                'Remaining Evacuees': int(total_alive), 
+                'Remaining Evacuees': total_alive, 
                 'Density Evolution': avg_density,
                 'Velocity of Evacuees': avg_speed,
                 'Peak Density': max_rho, 
@@ -991,7 +1023,7 @@ class MCASimulation:
             
             cell_data.append({
                 'Cell ID': cid,
-                'Spatial Distribution (Casualties)': int(final_deaths),
+                'Spatial Distribution (Casualties)': final_deaths,
                 'Area': area,
                 'Status': 'BLOCKED' if cid in self.blocked_cells else 'OPEN'
             })
@@ -1130,9 +1162,9 @@ def main():
             'Avg Density (p/m2)': float(f"{mean_density:.2f}"),
             'Avg Velocity (m/s)': float(f"{mean_velocity:.2f}"),
             'Peak Density (p/m2)': float(f"{peak_density:.2f}"),
-            'Total Casualties': int(total_casualties),
+            'Total Casualties': total_casualties,
             'Total Evacuated': int(total_evacuated),
-            'Remaining Agents': int(remaining_agents),
+            'Remaining Agents': remaining_agents,
             'Total Evacuation Time (s)': float(total_time)
         })
         
@@ -1152,9 +1184,9 @@ def main():
     # Calculate Average of Runs
     avg_row = df_runs.mean(numeric_only=True)
     avg_row['Run'] = 'AVERAGE' 
-    avg_row['Total Casualties'] = int(avg_row['Total Casualties'])
+    avg_row['Total Casualties'] = avg_row['Total Casualties']
     avg_row['Total Evacuated'] = int(avg_row['Total Evacuated'])
-    avg_row['Remaining Agents'] = int(avg_row['Remaining Agents'])
+    avg_row['Remaining Agents'] = avg_row['Remaining Agents']
     
     df_runs_final = pd.concat([df_runs, pd.DataFrame([avg_row])], ignore_index=True)
 

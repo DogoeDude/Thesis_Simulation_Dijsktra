@@ -651,6 +651,11 @@ class MCASimulation:
         # But run() relies on init.
         # Let's trust initialize_population to do the reset before run.
         
+        # Log Initial State (Step 0)
+        initial_pop = sum(self.population.values())
+        initial_evac = sum(self.exit_usage.values())
+        print(f"Step 0 (Start): Agents: {initial_pop:.0f} | Evacuated: {initial_evac:.0f} | Dead: {self.casualties:.0f}")
+
         for t in range(steps):
             total = self.step()
             self.history.append(self.population.copy())
@@ -658,8 +663,9 @@ class MCASimulation:
             self.per_cell_casualty_history.append(self.casualties_per_cell.copy())
             self.exit_usage_history.append(self.exit_usage.copy())
             
-            if t % 10 == 0:
-                print(f"Step {t}: Agents: {total:.0f} | Dead: {self.casualties:.0f}")
+            if (t + 1) % 10 == 0:
+                curr_evac = sum(self.exit_usage.values())
+                print(f"Step {t+1}: Agents: {total:.0f} | Evacuated: {curr_evac:.0f} | Dead: {self.casualties:.0f}")
             if total < 1:
                 break
         
@@ -741,11 +747,11 @@ class MCASimulation:
             time_data.append({
                 'Time (s)': t * self.DT,
                 'Exit Flow Rate': int(flow_step),
-                'Remaining Evacuees': int(total_alive),
+                'Remaining Evacuees': total_alive,
                 'Density Evolution': avg_density,
                 'Velocity of Evacuees': avg_speed,
                 'Peak Density': max_rho, 
-                'Cumulative Casualties': int(cas_count)
+                'Cumulative Casualties': cas_count
             })
             
         df_time = pd.DataFrame(time_data)
@@ -759,7 +765,7 @@ class MCASimulation:
             
             cell_data.append({
                 'Cell ID': cid,
-                'Spatial Distribution (Casualties)': int(final_deaths),
+                'Spatial Distribution (Casualties)': final_deaths,
                 'Area': area,
                 'Status': 'BLOCKED' if cid in self.blocked_cells else 'OPEN'
             })
@@ -1273,9 +1279,9 @@ def main():
     avg_row = df_runs.mean(numeric_only=True)
     avg_row['Run'] = 'AVERAGE' 
     # Cast integers for logic
-    avg_row['Total Casualties'] = int(avg_row['Total Casualties'])
+    avg_row['Total Casualties'] = avg_row['Total Casualties']
     avg_row['Total Evacuated'] = int(avg_row['Total Evacuated'])
-    avg_row['Remaining Agents'] = int(avg_row['Remaining Agents'])
+    avg_row['Remaining Agents'] = avg_row['Remaining Agents']
     
     # Append Average Row safely
     df_runs_final = pd.concat([df_runs, pd.DataFrame([avg_row])], ignore_index=True)

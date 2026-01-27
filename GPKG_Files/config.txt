@@ -1,1 +1,1 @@
-map = "ustp-map.gpkg"
+map = "ustp-new-map.gpkg"

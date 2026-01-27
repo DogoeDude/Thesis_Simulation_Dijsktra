@@ -799,20 +799,20 @@ class MCASimulation:
                 else:
                     # GROWTH PHASE
                     if p_dict['fire'] < 1.0:
-                        p_dict['fire'] = min(1.0, p_dict['fire'] + 0.01) # Slower Growth (was 0.05)
+                        p_dict['fire'] = min(1.0, p_dict['fire'] + 0.05) # Faster Growth (was 0.01)
                     else:
                         # Reached Peak -> Start Burnout (Switch to Decay)
                         # Increased burnout chance to 10% (So it actually dies out)
                         if random.random() < 0.10: 
                              self.burnt_cells.add(cid)
                 
-                # ADJUSTED: Threshold 0.2, Chance 5% (Very Slow Spread, contained)
+                # ADJUSTED: Threshold 0.2, Chance 15% (Faster Spread)
                 if p_dict['fire'] > 0.2 and cid not in self.burnt_cells:
                     neighbors = list(self.graph.neighbors(cid))
                     for n in neighbors:
-                         # 5% chance to ignite neighbor (reliable spread, but slow growth)
-                         if self.penalties[n]['fire'] == 0 and random.random() < 0.05:
-                             self.penalties[n]['fire'] = 0.2 # Start VERY small (needs ~10 steps to become dangerous)
+                         # 15% chance to ignite neighbor
+                         if self.penalties[n]['fire'] == 0 and random.random() < 0.15:
+                             self.penalties[n]['fire'] = 0.2 # Start small
                              # Also add smoke
                              self.penalties[n]['smoke'] = 0.6
                              
@@ -1103,7 +1103,13 @@ class MCASimulation:
             # Calculate Environmental Penalty (Fire + Smoke + Debris + Obstruction)
             # We ignore rho here because 'v_i' already accounts for density above.
             p_dict = self.penalties.get(cid, {})
-            env_penalty = p_dict.get('fire', 0) + p_dict.get('debris', 0) + p_dict.get('smoke', 0)*0.5 + p_dict.get('temp_obj', 0)
+            
+            # DELAY PENALTIES until T=20s (User Request)
+            # Rerouting depends on these values, so this delays rerouting too.
+            if self.time_step < 20:
+                 env_penalty = 0.0
+            else:
+                 env_penalty = p_dict.get('fire', 0) + p_dict.get('debris', 0) + p_dict.get('smoke', 0)*0.5 + p_dict.get('temp_obj', 0)
             
             # Impedance Factor: Speed *= (1.0 - (Penalty * 0.55))
             # User Request: "Do like 55%" (Interpret as 55% Slowdown Max)
@@ -1482,15 +1488,6 @@ class MCASimulation:
         self.view_mode = 'occupancy' 
         self.remaining_artist = None
         
-        # Visualization for Safe Zone Connections (Yellow Dashed Lines)
-        from matplotlib.collections import LineCollection
-        self.lc_safe_paths = LineCollection([], colors='yellow', linestyles='dashed', linewidths=2.5, zorder=20, alpha=0.8)
-        ax.add_collection(self.lc_safe_paths) 
-        
-        # NEW: Connectivity Visibility Layer (Gray Dotted Lines)
-        self.lc_connectivity_paths = LineCollection([], colors='gray', linestyles='dotted', linewidths=1.0, zorder=19, alpha=0.4)
-        ax.add_collection(self.lc_connectivity_paths)
-        
         # Visualization for Casualties (Markers)
         # We use a scatter plot to show 'X' marks where deaths occur
         self.scat_casualties = ax.scatter([], [], marker='x', s=100, color='red', linewidth=2.0, zorder=30) 
@@ -1617,77 +1614,11 @@ class MCASimulation:
         def update(frame):
             self.current_frame = frame
             
-            # --- PHASE 1: DIJKSTRA FORMATION (PROGRESSIVE HEATMAP) ---
-            if hasattr(self, 'dijkstra_history') and frame < len(self.dijkstra_history):
-                step_data = self.dijkstra_history[frame]
-                visited_nodes = step_data['visited']
-                phase = step_data.get('phase', 'UNKNOWN')
-                active_dists = step_data.get('distances', self.dijkstra_distances)
-                
-                # Dynamic Colormap & Title
-                cmap_name = 'magma'
-                title_text = "Phase 1: Dijkstra Map Formation"
-                
-                # Normalize based on Active Map MAX (Calculated BEFORE branching)
-                max_d = 0
-                for d in active_dists.values():
-                     if d != float('inf'): max_d = max(max_d, d)
-
-                if 'facecolors' in step_data:
-                     # Multi-Color Mode (Phase 1A)
-                     title_text = "Phase 1A: Computing Exit Field (Colored by Source Exit)"
-                     collection.set_array(None) 
-                     collection.set_facecolors(step_data['facecolors'])
-                else:
-                    if phase == 'EXIT_FIELD':
-                        cmap_name = 'summer' # Greenish
-                        title_text = "Phase 1A: Computing Exit Field (Exits -> Safe Zones)"
-                    elif phase == 'SAFE_FIELD':
-                        cmap_name = 'autumn_r' # Red-Orange
-                        title_text = "Phase 1B: Computing Safe Zone Field (Safe Zones -> Agents)"
-                    
-                    ratios = []
-                    for idx in self.road_cells['id']:
-                         if idx in visited_nodes:
-                             d = active_dists.get(idx, float('inf'))
-                             if d != float('inf') and max_d > 0:
-                                 ratios.append(1.0 - (d / max_d)) 
-                             else:
-                                 ratios.append(0.0)
-                         else:
-                             ratios.append(0.0)
-                    
-                    collection.set_array(np.array(ratios))
-                    collection.set_cmap(cmap_name) 
-                    collection.set_clim(0, 1.0)
-                
-                info_text.set_text(
-                    f"🌊 {phase}\n"
-                    f"Nodes Scanned: {len(visited_nodes)}\n"
-                    f"Max Dist: {max_d:.1f}m"
-                )
-                
-                ax.set_title(title_text, fontsize=14, fontweight='bold')
-                return collection, info_text
-
             # --- PHASE 2: EVACUATION ---
-            # Hide safe zone paths in Dijkstra mode (keep it clean like Pure version)
-            if hasattr(self, 'lc_safe_paths'):
-                if self.view_mode == 'dijkstra':
-                    self.lc_safe_paths.set_segments([])
-                else:
-                    # Only show in other modes if needed
-                    self.lc_safe_paths.set_segments([])
-
-            # --- NEW: UPDATE CONNECTIVITY VISIBILITY ---
-            # Hide these paths to keep visualization clean like Pure version
-            if hasattr(self, 'lc_connectivity_paths'):
-                self.lc_connectivity_paths.set_segments([])
-
             # Correct frame mapping
             sim_frame = frame
             
-            # SUBTRACT Dijkstra Pre-Roll Frames
+            # SUBTRACT Dijkstra Pre-Roll Frames (If any remains)
             if hasattr(self, 'dijkstra_history'):
                  sim_frame = frame - len(self.dijkstra_history)
 
@@ -1707,6 +1638,10 @@ class MCASimulation:
                  # Reset Scatter visibility
                  self.scat_casualties.set_visible(False)
                  self.scat_penalties.set_visible(False)
+
+                 # RESET Facecolors (Critical fix for toggle persistence)
+                 collection.set_facecolors(None)
+                 collection.set_edgecolors('lightgray')
 
                  collection.set_cmap('turbo')
                  
@@ -1744,86 +1679,37 @@ class MCASimulation:
                  else:
                      self.quiver = None
  
-            # 2. DIJKSTRA STATIC FIELD (Ported from Pure)
-            elif self.view_mode == 'dijkstra':
-                 ax.set_title("Static Dijkstra Field (Heatmap: Distance | Arrows: Gradient)", fontsize=14, fontweight='bold')
-                 self.scat_casualties.set_visible(False)
-                 self.scat_penalties.set_visible(False)
-                 
-                 # Show Distance Map (STATIC - not time-varying)
-                 d_vals = []
-                 max_d = 0
-                 for idx in self.road_cells['id']:
-                      d = self.dijkstra_distances.get(idx, float('inf'))
-                      if d != float('inf'): max_d = max(max_d, d)
-                      d_vals.append(d)
-                 
-                 # Normalize (Inverse)
-                 norm_vals = []
-                 for d in d_vals:
-                     if d == float('inf'): norm_vals.append(0)
-                     else: 
-                         val = 1.0 - (d / max_d) if max_d > 0 else 0
-                         norm_vals.append(val)
-                 
-                 collection.set_array(np.array(norm_vals))
-                 collection.set_cmap('magma') 
-                 collection.set_clim(0, 1.0)
-                 
-                 if self.quiver: 
-                     self.quiver.remove()
-                 
-                 # STATIC GLOBAL FLOW ARROWS - Shows gradient direction for ALL cells
-                 xq, yq, uq, vq = [], [], [], []
-                 for idx, (u, v) in self.global_flow_vectors.items():
-                     centroid = self.cell_centroids.get(idx)
-                     if centroid and (u != 0 or v != 0):
-                         xq.append(centroid.x)
-                         yq.append(centroid.y)
-                         uq.append(u)
-                         vq.append(v)
-                 
-                 if xq:
-                     # White arrows for visibility on Magma
-                     # DISABLED PER USER FEEDBACK ("White Lines")
-                     # self.quiver = ax.quiver(xq, yq, uq, vq, scale=30, width=0.003, color='white', alpha=0.5, zorder=6)
-                     self.quiver = None
-                 else:
-                     self.quiver = None
-
             # 4. PENALTIES HEATMAP (NEW)
             # 4. PENALTIES HEATMAP (NEW) -> MODIFIED TO SCATTER MARKERS
+             # 4. PENALTIES HEATMAP (Visualized as Road Cell Heatmap)
             elif self.view_mode == 'penalties':
-                 ax.set_title(f"Hazard Penalties (Orange X) (T={sim_frame}s)", fontsize=14, fontweight='bold')
+                 ax.set_title(f"Hazard Penalties (Heatmap) (T={sim_frame}s)", fontsize=14, fontweight='bold')
                  self.scat_casualties.set_visible(False)
                  if self.quiver: self.quiver.remove(); self.quiver = None
+                 self.scat_penalties.set_visible(False) # Hide markers
                  
-                 # Clear Background Heatmap
-                 collection.set_array(None)
-                 collection.set_facecolors('whitesmoke')
-                 
-                 # Fetch Data
+                 # RESET Facecolors (Critical fix for toggle persistence)
+                 collection.set_facecolors(None)
+                 collection.set_edgecolors('lightgray') # Maintain grid lines
                  p_map = {}
                  if sim_frame < len(self.penalty_history):
                      p_map = self.penalty_history[sim_frame]
-                
-                 # Filter for active hazards
-                 x_vals, y_vals, sizes = [], [], []
-                 for idx, val in p_map.items():
-                     if val > 0.01: # Threshold to filter clutter
-                         pt = self.cell_centroids.get(idx)
-                         if pt:
-                             x_vals.append(pt.x)
-                             y_vals.append(pt.y)
-                             # Size scales with penalty? or fixed?
-                             sizes.append(100 + val * 100)
-                             
-                 if x_vals:
-                     self.scat_penalties.set_offsets(np.column_stack([x_vals, y_vals]))
-                     self.scat_penalties.set_sizes(sizes)
-                     self.scat_penalties.set_visible(True)
-                 else:
-                     self.scat_penalties.set_visible(False)
+                 
+                 # Apply to Road Cells (Heatmap)
+                 vals = []
+                 for idx in self.road_cells['id']:
+                     # Use composite penalty or just sum components?
+                     # Let's use the explicit composite score if avail in history,
+                     # or compute on fly from dict if not.
+                     # p_map here is a DICT of floats (score) from self.penalty_history
+                     # which was stored as: current_penalties[cid] = metric
+                     
+                     val = p_map.get(idx, 0.0)
+                     vals.append(val)
+                 
+                 collection.set_array(np.array(vals))
+                 collection.set_cmap('YlOrRd') # Yellow -> Orange -> Red
+                 collection.set_clim(0, 1.0)
 
             # 5. CASUALTIES HEATMAP/MARKERS
 
@@ -1933,17 +1819,14 @@ class MCASimulation:
         
         # 3rd Button: DIJKSTRA
         # 3rd Button: DIJKSTRA
-        ax_btn_dijk = plt.axes([0.65, 0.04, 0.12, 0.04])
-        self.btn_dijkstra = Button(ax_btn_dijk, 'Dijkstra', color='lightblue', hovercolor='cyan')
-
         # 4th Button: PENALTIES (NEW)
-        ax_btn_pen = plt.axes([0.78, 0.04, 0.12, 0.04])
+        ax_btn_pen = plt.axes([0.65, 0.04, 0.12, 0.04]) # Moved left
         self.btn_penalty = Button(ax_btn_pen, 'Penalties', color='#FFA500', hovercolor='#FFD700')
 
         def set_view_mode(mode):
             self.view_mode = mode
             self.btn_casualty.color = 'salmon'
-            self.btn_dijkstra.color = 'lightblue'
+            # Dijkstra button removed
             self.btn_penalty.color = '#FFA500' # Orange
             
             if mode == 'casualties':
@@ -1972,16 +1855,11 @@ class MCASimulation:
             if self.view_mode == 'casualties': set_view_mode('occupancy')
             else: set_view_mode('casualties')
                 
-        def toggle_dijkstra(event):
-            if self.view_mode == 'dijkstra': set_view_mode('occupancy')
-            else: set_view_mode('dijkstra')
-            
         def toggle_penalty(event):
             if self.view_mode == 'penalties': set_view_mode('occupancy')
             else: set_view_mode('penalties')
             
         self.btn_casualty.on_clicked(toggle_casualty)
-        self.btn_dijkstra.on_clicked(toggle_dijkstra)
         self.btn_penalty.on_clicked(toggle_penalty)
 
         def toggle_pause(event):

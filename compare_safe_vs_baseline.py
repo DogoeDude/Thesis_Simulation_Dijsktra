@@ -82,9 +82,9 @@ def load_data_with_meta(name, path):
         # Agents (Sum ofavgs)
         s = data['scalars']
         if s is not None:
-             ev = s.get('Total Evacuated', 0)
-             rem = s.get('Remaining Agents', 0)
-             cas = s.get('Total Casualties', 0)
+             ev = float(s.get('Total Evacuated', 0))
+             rem = float(s.get('Remaining Agents', 0))
+             cas = float(s.get('Total Casualties', 0))
              data['agent_count'] = int(round(ev + rem + cas))
         else:
              data['agent_count'] = "?"
@@ -239,7 +239,10 @@ with open(output_file, "w", encoding="utf-8") as f:
                             break
                             
                 if val is not None:
-                    tot_cas = f"{val:.2f}"
+                    try:
+                        tot_cas = f"{float(val):.2f}"
+                    except:
+                        tot_cas = str(val)
 
             f.write(f"--- {m} Top Hazard Zones (Total Casualties: {tot_cas}) ---\n")
             if models[m]['spatial'] is not None:

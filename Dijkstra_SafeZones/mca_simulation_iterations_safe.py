@@ -1183,6 +1183,7 @@ def main():
     
     # Calculate Average of Runs
     avg_row = df_runs.mean(numeric_only=True)
+    avg_row = avg_row.astype(object) # Allow string assignment
     avg_row['Run'] = 'AVERAGE' 
     avg_row['Total Casualties'] = avg_row['Total Casualties']
     avg_row['Total Evacuated'] = int(avg_row['Total Evacuated'])

@@ -1662,26 +1662,32 @@ class MCASimulation:
                      self.quiver = None
                  
                  # Color Map for Floodfill
-                 # Unvisited: White/Gray
-                 # Visited: Blue gradient? Or simple filled color.
-                 # Active Frontier: Bright Cyan
+                 # 1. PRE-COMPUTED COLORS (Phase A - Multi-Source Field)
+                 if 'facecolors' in step_data:
+                     collection.set_array(None)
+                     collection.set_facecolors(step_data['facecolors'])
+                     collection.set_edgecolors('face') # Smoother look
                  
-                 collection.set_facecolors(None)
-                 collection.set_edgecolors('lightgray')
-                 
-                 # Create color array
-                 # 0 = Unvisited, 0.5 = Visited, 1.0 = Active
-                 colors = []
-                 for cid in self.road_cells['id']:
-                     if cid in active: val = 1.0
-                     elif cid in visited: val = 0.5
-                     else: val = 0.0
-                     colors.append(val)
-                 
-                 collection.set_array(np.array(colors))
-                 # Use a distinct cmap for floodfill (e.g., Blues)
-                 collection.set_cmap('Blues') 
-                 collection.set_clim(0, 1.0)
+                 # 2. DYNAMIC GRADIENT (Phase B - Safe Zones)
+                 else:
+                     # Use Distance Mapping for smoother gradient
+                     dists = step_data.get('distances', {})
+                     colors = []
+                     max_d = 200.0 # clamp
+                     for cid in self.road_cells['id']:
+                         if cid in active: 
+                             colors.append(0.0) # Highlight active front (Dark/Low val)
+                         elif cid in visited: 
+                             d = dists.get(cid, 0)
+                             norm = min(1.0, d / max_d)
+                             colors.append(0.2 + 0.8 * norm) # 0.2 (Dark) -> 1.0 (Light)
+                         else: 
+                             colors.append(1.0) # Unvisited (White/Max)
+                     
+                     collection.set_array(np.array(colors))
+                     collection.set_cmap('magma_r') # Reversed Magma: Dark (Close) -> Light (Far)
+                     collection.set_clim(0, 1.0) 
+                     collection.set_facecolors([]) # Start fresh
                  
                  # Update Status text
                  info_text.set_text(

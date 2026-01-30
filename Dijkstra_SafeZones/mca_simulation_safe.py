@@ -589,6 +589,7 @@ class MCASimulation:
             
             self.dijkstra_history.append({
                 'visited': visited_1.copy(),
+                'active': set(node for node, dist in chunk),
                 'phase': 'EXIT_FIELD',
                 'distances': self.dist_to_exit,
                 'facecolors': fcolors
@@ -598,6 +599,7 @@ class MCASimulation:
         for _ in range(5):
              self.dijkstra_history.append({
                 'visited': visited_1.copy(),
+                'active': set(),
                 'phase': 'EXIT_FIELD',
                 'distances': self.dist_to_exit
             })
@@ -611,13 +613,14 @@ class MCASimulation:
             for node, dist in chunk: visited_2.add(node)
             self.dijkstra_history.append({
                 'visited': visited_2.copy(),
+                'active': set(node for node, dist in chunk),
                 'phase': 'SAFE_FIELD',
                 'distances': self.dijkstra_distances
             })
         
         # Ensure final frame exists
         if not self.dijkstra_history: 
-             self.dijkstra_history.append({'visited': set(), 'phase':'SAFE_FIELD', 'distances':self.dijkstra_distances})
+             self.dijkstra_history.append({'visited': set(), 'active': set(), 'phase':'SAFE_FIELD', 'distances':self.dijkstra_distances})
         
         # Derive Flow Directions (Gradient Descent on FINAL field)
         self.directions = {}
@@ -854,9 +857,11 @@ class MCASimulation:
         step_exit_flow = {} # NEW: Buffer for exit usage
         total_deaths_this_step = 0
         
-        # 1. Check for Stampedes
+        # 1. Casualty Calculation (Stampede + Environmental)
         if self.time_step > 10:
             for cid, count in self.population.items():
+                if count <= 0: continue
+                
                 # SAFE ZONE IMMUNITY: No casualties in Safe Zones/Refuge Areas
                 if hasattr(self, 'safe_zone_cells') and cid in self.safe_zone_cells:
                     continue
@@ -864,6 +869,7 @@ class MCASimulation:
                 area = self.cell_areas.get(cid, 60.0)
                 rho = count / area if area > 0 else 0
                 
+                # A. STAMPEDE (Density-based)
                 if rho > self.STAMPEDE_DENSITY:
                     deaths = count * self.DEATH_RATE
                     new_population[cid] -= deaths
@@ -1315,7 +1321,7 @@ class MCASimulation:
         
         # Randomize Hazard Start
         import random
-        fire_start_time = random.randint(30, 40)
+        fire_start_time = 20 # Fixed start time as requested
         fire_locs = []
         
         # Pick 2 Random Cells explicitly NOT near Exts
@@ -1404,9 +1410,13 @@ class MCASimulation:
         print(f"  Evacuated:     {total_evacuated:.0f}")
         print(f"  Dead:          {total_dead:.0f}")
         print(f"  Calculated Sum:{final_total:.0f}")
-        diff = self.total_agents_init - final_total
-        print(f"  DISCREPANCY:   {diff:.0f}")
-        if abs(diff) > 1.0:
+        print(f"  DISCREPANCY:   {self.total_agents_init - final_total:.2f}")
+        
+        if total_remaining > 0:
+            stranded_cells = {cid: c for cid, c in self.population.items() if c > 0.01}
+            print(f"  > ⚠️ STRANDED AGENTS LOCATIONS: {stranded_cells}")
+            
+        if abs(self.total_agents_init - final_total) > 1.0:
             print("  ⚠️ WARNING: AGENTS MISSING! DEBUG 'step' FUNCTION!")
         else:
             print("  ✅ AGENT ACCOUNTING BALANCED.")
@@ -1487,6 +1497,20 @@ class MCASimulation:
         self.current_frame = 0
         self.view_mode = 'occupancy' 
         self.remaining_artist = None
+
+        # Pre-Compute Flow Vectors for Arrow Visualization
+        self.flow_vectors = {}
+        if hasattr(self, 'directions'):
+            import math
+            for u, v in self.directions.items():
+                if v is not None and u in self.cell_centroids and v in self.cell_centroids:
+                    p1 = self.cell_centroids[u]
+                    p2 = self.cell_centroids[v]
+                    dx = p2.x - p1.x
+                    dy = p2.y - p1.y
+                    norm = math.hypot(dx, dy)
+                    if norm > 0:
+                        self.flow_vectors[u] = (dx/norm, dy/norm)
         
         # Visualization for Casualties (Markers)
         # We use a scatter plot to show 'X' marks where deaths occur
@@ -1557,22 +1581,23 @@ class MCASimulation:
                 p = pop_data.get(cid, 0)
                 c = self.capacities.get(cid, 1)
                 
+                # Calculate Density (rho)
+                area = self.cell_areas.get(cid, 60.0)
+                rho = p / area if area > 0 else 0.0
+                thresh = self.STAMPEDE_DENSITY if hasattr(self, 'STAMPEDE_DENSITY') else 5.0
+                
                 ratio = p / c if c > 0 else 0
                 status = "OK"
                 if ratio > 0.5: status = "BUSY"
                 if ratio >= 1.0: status = "OVERCROWDED"
+                if rho > thresh: status = "!!! STAMPEDE !!!"
                 
                 selected_cell_text.set_text(
                     f"Cell ID: {cid}\n"
                     f"Pop: {p:.0f} / Cap: {c:.0f}\n"
-                    f"Occupancy: {ratio*100:.1f}%\n"
-                    f"Status: {status}"
-                )
-                
-                selected_cell_text.set_text(
-                    f"Cell ID: {cid}\n"
-                    f"Pop: {p:.0f} / Cap: {c:.0f}\n"
-                    f"Occupancy: {ratio*100:.1f}%\n"
+                    f"Area: {area:.1f} m²\n"
+                    f"Density: {rho:.2f} ag/m²\n"
+                    f"Threshold: {thresh:.1f}\n"
                     f"Status: {status}"
                 )
             elif self.view_mode == 'dijkstra':
@@ -1594,10 +1619,16 @@ class MCASimulation:
                 if sim_frame < len(self.penalty_history):
                     score = self.penalty_history[sim_frame].get(cid, 0)
                 
+                # Retrieve Density for Context
+                pop_data = self.history[sim_frame]
+                p = pop_data.get(cid, 0)
+                area = self.cell_areas.get(cid, 60.0)
+                rho = p / area if area > 0 else 0.0
+
                 selected_cell_text.set_text(
                     f"Cell ID: {cid}\n"
-                    f"Penalty Score: {score:.3f}\n"
-                    f"(Max 0.95)"
+                    f"Penalty: {score:.2f}\n"
+                    f"Density: {rho:.2f} ag/m²"
                 )
             else:
                 if sim_frame < len(self.per_cell_casualty_history):
@@ -1614,6 +1645,55 @@ class MCASimulation:
         def update(frame):
             self.current_frame = frame
             
+            # --- PHASE 1: DIJKSTRA FLOODFILL ---
+            # If we are in the intro phase, visualize the floodfill process
+            if hasattr(self, 'dijkstra_history') and frame < len(self.dijkstra_history):
+                 step_data = self.dijkstra_history[frame]
+                 visited = step_data['visited']
+                 active = step_data['active']
+                 
+                 ax.set_title(f"Phase 1: Floodfill Initialization (Step {frame})", fontsize=14, fontweight='bold')
+                 
+                 # Hide Phase 2 Artifacts
+                 self.scat_casualties.set_visible(False)
+                 self.scat_penalties.set_visible(False)
+                 if self.quiver: 
+                     self.quiver.remove()
+                     self.quiver = None
+                 
+                 # Color Map for Floodfill
+                 # Unvisited: White/Gray
+                 # Visited: Blue gradient? Or simple filled color.
+                 # Active Frontier: Bright Cyan
+                 
+                 collection.set_facecolors(None)
+                 collection.set_edgecolors('lightgray')
+                 
+                 # Create color array
+                 # 0 = Unvisited, 0.5 = Visited, 1.0 = Active
+                 colors = []
+                 for cid in self.road_cells['id']:
+                     if cid in active: val = 1.0
+                     elif cid in visited: val = 0.5
+                     else: val = 0.0
+                     colors.append(val)
+                 
+                 collection.set_array(np.array(colors))
+                 # Use a distinct cmap for floodfill (e.g., Blues)
+                 collection.set_cmap('Blues') 
+                 collection.set_clim(0, 1.0)
+                 
+                 # Update Status text
+                 info_text.set_text(
+                    f"🌊 FLOODFILL\n"
+                    f"Step: {frame}\n"
+                    f"Visited: {len(visited)}\n"
+                    f"Active: {len(active)}"
+                 )
+                 
+                 update_selection_text(frame)
+                 return collection, info_text, selected_cell_text
+
             # --- PHASE 2: EVACUATION ---
             # Correct frame mapping
             sim_frame = frame
@@ -1640,7 +1720,7 @@ class MCASimulation:
                  self.scat_penalties.set_visible(False)
 
                  # RESET Facecolors (Critical fix for toggle persistence)
-                 collection.set_facecolors(None)
+                 collection.set_facecolors([]) # Empty list resets to use cmap array
                  collection.set_edgecolors('lightgray')
 
                  collection.set_cmap('turbo')
@@ -1686,10 +1766,10 @@ class MCASimulation:
                  ax.set_title(f"Hazard Penalties (Heatmap) (T={sim_frame}s)", fontsize=14, fontweight='bold')
                  self.scat_casualties.set_visible(False)
                  if self.quiver: self.quiver.remove(); self.quiver = None
-                 self.scat_penalties.set_visible(False) # Hide markers
+                 self.scat_penalties.set_visible(True) # Show markers
                  
                  # RESET Facecolors (Critical fix for toggle persistence)
-                 collection.set_facecolors(None)
+                 collection.set_facecolors([])
                  collection.set_edgecolors('lightgray') # Maintain grid lines
                  p_map = {}
                  if sim_frame < len(self.penalty_history):
@@ -1710,6 +1790,23 @@ class MCASimulation:
                  collection.set_array(np.array(vals))
                  collection.set_cmap('YlOrRd') # Yellow -> Orange -> Red
                  collection.set_clim(0, 1.0)
+                 
+                 # UPDATE MARKERS for Penalties
+                 px, py, ps = [], [], []
+                 for cid, score in p_map.items():
+                     if score > 0.1: # Threshold to show marker
+                         pt = self.cell_centroids.get(cid)
+                         if pt:
+                             px.append(pt.x)
+                             py.append(pt.y)
+                             # Scale size by intensity
+                             ps.append(100 + score * 200)
+                 
+                 if px:
+                     self.scat_penalties.set_offsets(np.column_stack([px, py]))
+                     self.scat_penalties.set_sizes(ps)
+                 else:
+                     self.scat_penalties.set_visible(False)
 
             # 5. CASUALTIES HEATMAP/MARKERS
 
@@ -1784,14 +1881,22 @@ class MCASimulation:
                      self.remaining_artist = None
 
             current_agents = sum(pop_data.values())
-            evacuated_count = self.total_agents_init - int(current_agents) - int(casualties)
+            
+            # CONSISTENCY FIX: Summing exit usage accounts prevents rounding discrepancies
+            evacuated_count = 0
+            if sim_frame < len(self.exit_usage_history):
+                 evacuated_count = sum(self.exit_usage_history[sim_frame].values())
+            else:
+                 evacuated_count = sum(self.exit_usage.values())
+            
+            evacuated_count = int(evacuated_count)
             
             status_line = ""
             if frame == len(self.history) - 1 and current_agents > 0:
                 status_line = f"\n⚠️ FINAL: {int(current_agents)} Agents Stranded (Magenta)"
 
             info_text.set_text(
-                f"⏱️ Time: {frame}s\n"
+                f"⏱️ Time: {sim_frame}s\n"
                 f"👥 Alive: {int(current_agents)}\n"
                 f"💀 Casualties: {int(casualties)}\n"
                 f"✅ Evacuated: {evacuated_count}"
@@ -1960,8 +2065,8 @@ class MCASimulation:
         fig.canvas.mpl_connect('motion_notify_event', on_motion)
         fig.canvas.mpl_connect('scroll_event', on_scroll)
         
-        total_frames = len(self.history)
-        total_frames = len(self.history)
+        # FIX: Total frames must include BOTH the Intro (Dijkstra) and the Run (History)
+        total_frames = len(self.dijkstra_history) + len(self.history)
         # (Removed garbage offset logic)
 
         self.anim = FuncAnimation(fig, update, frames=total_frames, interval=100, blit=False, repeat=False)

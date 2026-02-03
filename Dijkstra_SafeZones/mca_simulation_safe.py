@@ -802,22 +802,22 @@ class MCASimulation:
                 else:
                     # GROWTH PHASE
                     if p_dict['fire'] < 1.0:
-                        p_dict['fire'] = min(1.0, p_dict['fire'] + 0.05) # Faster Growth (was 0.01)
+                        p_dict['fire'] = min(1.0, p_dict['fire'] + 0.03) # Moderate Growth (was 0.01)
                     else:
                         # Reached Peak -> Start Burnout (Switch to Decay)
                         # Increased burnout chance to 10% (So it actually dies out)
                         if random.random() < 0.10: 
                              self.burnt_cells.add(cid)
                 
-                # ADJUSTED: Threshold 0.2, Chance 15% (Faster Spread)
-                if p_dict['fire'] > 0.2 and cid not in self.burnt_cells:
+                # ADJUSTED: Threshold 0.2, Chance 11% (User Requested)
+                if p_dict['fire'] > 0.4 and cid not in self.burnt_cells:
                     neighbors = list(self.graph.neighbors(cid))
                     for n in neighbors:
-                         # 15% chance to ignite neighbor
-                         if self.penalties[n]['fire'] == 0 and random.random() < 0.15:
-                             self.penalties[n]['fire'] = 0.2 # Start small
+                         # 11% chance to ignite neighbor
+                         if self.penalties[n]['fire'] == 0 and random.random() < 0.13:
+                             self.penalties[n]['fire'] = 0.1 # Start small
                              # Also add smoke
-                             self.penalties[n]['smoke'] = 0.6
+                             self.penalties[n]['smoke'] = 0.4
                              
     def trigger_random_events(self):
         """
@@ -979,32 +979,23 @@ class MCASimulation:
                     best_center = cid
             
             if best_center is not None and best_score > 0.3:
-                # LOCAL REPAIR via ANCHORS
-                # Radius? Increased to 500m to catch distant junctions
-                RADIUS = 500.0 
-                # Identify which Field to repair? 
-                # Stage 2 uses 'self.dijkstra_distances' (from Safe Zones)
-                # If d_safe is INF, it uses 'self.dist_to_exit' (fallback).
-                # We mainly repair 'self.dijkstra_distances' (Safe Zone Flow).
+                # LOCAL REPAIR via RDD (Inconsistency-Based)
+                print(f"  > RDD REPAIR TRIGGERED: Hazard at Cell {best_center}")
                 
-                print(f"  > Running Anchor-Based Local Repair around Cell {best_center} (R={RADIUS}m)...")
-                
-                # We need the current dist map. 
-                # NOTE: self.dijkstra_distances might be incomplete if fallback was used.
-                # Let's ensure we are repairing the active field.
+                # RDD REPAIR
+                # We do NOT use a radius. We pass the hazard center, and it traces the "Disturbed Branch".
                 
                 target_field = self.dijkstra_distances
                 
-                updates = Dijkstra.calculate_dijkstra_repair(
-                    self.graph, best_center, RADIUS, target_field,
-                    sources=self.safe_zone_cells  # CRITICAL: Re-seed Safe Zones if inside radius
+                updates = Dijkstra.calculate_rdd_repair(
+                    self.graph, best_center, target_field
                 )
                 
                 # Apply updates
                 for n, new_d in updates.items():
                     target_field[n] = new_d
                     
-                print(f"  > Local Repair Complete. Updated {len(updates)} nodes.")
+                print(f"  > RDD Repair Complete. Patched {len(updates)} nodes (Disturbed Branch).")
                 
             else:
                 # Fallback to Global if no clear center (shouldn't happen with trigger)
@@ -1020,24 +1011,15 @@ class MCASimulation:
                     )
             
             # Re-derive directions (PARTIAL UPDATE OPTIMIZATION)
-            # Only update nodes that were in the 'updates' set (plus neighbors?)
-            # Conservative: Update all, or update 'updates'.
-            # If we only update 'updates', we might miss neighbors flowing INTO updates.
-            # Safe Strategy: Update all nodes in affected zone + Rim.
+            # Update directions for all nodes that were patched + their neighbors
+            nodes_to_update = set(updates.keys())
             
-            # For simplicity in this step, let's just re-derive directions for ALL 
-            # (Calculation is cheap compared to Dijkstra).
-            # Or use the Radius again.
+            # Also add neighbors of patched nodes (to ensure inflow is correct)
+            for n in updates.keys():
+                for neighbor in self.graph.neighbors(n):
+                    nodes_to_update.add(neighbor)
             
-            nodes_to_update = self.graph.nodes
-            if best_center is not None:
-                # Optimized: Only update directions for nodes in Radius + Buffer
-                nodes_to_update = []
-                c_pt = self.graph.nodes[best_center]['geometry'].centroid
-                UP_RAD = RADIUS + 20.0 # Buffer
-                for n in self.graph.nodes:
-                    if self.graph.nodes[n]['geometry'].centroid.distance(c_pt) <= UP_RAD:
-                        nodes_to_update.append(n)
+            nodes_to_update = list(nodes_to_update)
             
             for node in nodes_to_update:
                 if node in self.exits_ids:
@@ -1047,15 +1029,38 @@ class MCASimulation:
                 d_safe = self.dijkstra_distances.get(node, float('inf'))
                 source_field = self.dijkstra_distances if d_safe != float('inf') else self.dist_to_exit
                 
-                current_best = source_field.get(node, float('inf'))
-                best_neighbor = None
+                # Robust Tie-Breaking Logic
+                current_target = self.directions.get(node)
+                
+                # 1. Find absolute minimum distance among neighbors
+                min_dist = source_field.get(node, float('inf')) # Start with self? No, neighbors must be better.
+                # Actually, standard gradient descent looks for ANY neighbor with lower cost.
+                
+                candidates = []
+                best_d_found = float('inf')
                 
                 for neighbor in self.graph.neighbors(node):
                     d = source_field.get(neighbor, float('inf'))
-                    # Dijkstra field ALREADY accounts for weight.
-                    if d < current_best:
-                        current_best = d
-                        best_neighbor = neighbor
+                    if d < best_d_found:
+                         best_d_found = d
+                
+                # 2. Collect all neighbors within epsilon of the best found distance
+                # (Only if they are better than self, or just best available?)
+                # Gradient descent: Move to neighbor with MIN distance.
+                
+                candidates = [n for n in self.graph.neighbors(node) 
+                              if abs(source_field.get(n, float('inf')) - best_d_found) < 1e-5]
+                
+                # 3. Select Best
+                if candidates:
+                    # Stickiness: If current target is in the top tier, keep it.
+                    if current_target in candidates:
+                        best_neighbor = current_target
+                    else:
+                        # Tie-breaker: Pick one (First / deterministic)
+                        best_neighbor = candidates[0]
+                else:
+                    best_neighbor = None
                 
                 self.directions[node] = best_neighbor
 
@@ -1300,7 +1305,7 @@ class MCASimulation:
                     print(f"✅ Simulation results saved to {filename} (Unstyled)")
 
         except Exception as e:
-            print(f"❌ Failed to save Excel: {e}")
+            print(f"[ERROR] Failed to save Excel: {e}")
 
     def run(self, steps=100):
         print(f"Starting simulation for {steps} steps...")
@@ -1414,12 +1419,12 @@ class MCASimulation:
         
         if total_remaining > 0:
             stranded_cells = {cid: c for cid, c in self.population.items() if c > 0.01}
-            print(f"  > ⚠️ STRANDED AGENTS LOCATIONS: {stranded_cells}")
+            print(f"  > [WARNING] STRANDED AGENTS LOCATIONS: {stranded_cells}")
             
         if abs(self.total_agents_init - final_total) > 1.0:
-            print("  ⚠️ WARNING: AGENTS MISSING! DEBUG 'step' FUNCTION!")
+            print("  [WARNING] AGENTS MISSING! DEBUG 'step' FUNCTION!")
         else:
-            print("  ✅ AGENT ACCOUNTING BALANCED.")
+            print("  [OK] AGENT ACCOUNTING BALANCED.")
         print("="*40 + "\n")
         
         # Export Data
@@ -1437,7 +1442,7 @@ class MCASimulation:
                 area = self.cell_areas.get(cid, 0)
                 cap = self.max_capacities.get(cid, 0)
                 degree = len(list(self.graph.neighbors(cid))) if cid in self.graph else 0
-                print(f"  Cell {cid:>4}: {deaths:>6.1f} deaths | Area: {area:>5.1f}m2 | MaxCap: {cap:>5.1f} | Neighbors: {degree}")
+                print(f"  Cell {cid:>4}: {deaths:>6.1f} casualties | Area: {area:>5.1f}m2 | MaxCap: {cap:>5.1f} | Neighbors: {degree}")
                 count += 1
         
         if count == 0: print("  No casualties reported.")
@@ -1752,13 +1757,28 @@ class MCASimulation:
                  for idx, count in pop_data.items():
                      if count > 1.0:
                           centroid = self.cell_centroids.get(idx)
-                          # FIX: Use Pre-Computed Stable Flow Vectors
-                          vec = self.flow_vectors.get(idx)
-                          if vec and vec != (0,0):
-                             xq.append(centroid.x)
-                             yq.append(centroid.y)
-                             uq.append(vec[0])
-                             vq.append(vec[1])
+                          # FIX: Derive Dynamic Vector from d_map
+                          # Find steepest descent neighbor in this frame's field
+                          best_n = None
+                          min_d = d_map.get(idx, float('inf'))
+                          
+                          # Gradient Search
+                          for n in self.graph.neighbors(idx):
+                              dn = d_map.get(n, float('inf'))
+                              if dn < min_d:
+                                  min_d = dn
+                                  best_n = n
+                                  
+                          if best_n:
+                              target_pt = self.cell_centroids[best_n]
+                              dx = target_pt.x - centroid.x
+                              dy = target_pt.y - centroid.y
+                              norm = np.hypot(dx, dy)
+                              if norm > 0:
+                                  xq.append(centroid.x)
+                                  yq.append(centroid.y)
+                                  uq.append(dx/norm)
+                                  vq.append(dy/norm)
                                
                  if xq:
                      self.quiver = ax.quiver(xq, yq, uq, vq, scale=30, width=0.003, color='black', alpha=0.6, zorder=6)

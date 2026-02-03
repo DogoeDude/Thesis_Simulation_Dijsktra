@@ -745,6 +745,7 @@ class MCASimulation:
             # Find the center of the hazard (cell with max penalty)
             best_center = None
             best_score = -1
+            updates = {} # CRITICAL FIX: Initialize updates to prevent crash
             
             for cid in self.graph.nodes:
                 p_dict = self.penalties[cid]
@@ -778,6 +779,11 @@ class MCASimulation:
                     initial_costs[sz] = d
                     
                 if self.safe_zone_cells:
+                    self.dijkstra_distances, _ = Dijkstra.calculate_dijkstra_field(
+                        self.graph, self.safe_zone_cells, initial_costs=initial_costs
+                    )
+                    # Global Recompute affects everyone
+                    updates = {n: self.dijkstra_distances.get(n, float('inf')) for n in self.graph.nodes}
                     self.dijkstra_distances, _ = Dijkstra.calculate_dijkstra_field(
                         self.graph, self.safe_zone_cells, initial_costs=initial_costs
                     )

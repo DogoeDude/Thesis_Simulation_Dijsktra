@@ -814,7 +814,7 @@ class MCASimulation:
                     neighbors = list(self.graph.neighbors(cid))
                     for n in neighbors:
                          # 11% chance to ignite neighbor
-                         if self.penalties[n]['fire'] == 0 and random.random() < 0.13:
+                         if self.penalties[n]['fire'] == 0 and random.random() < 0.14:
                              self.penalties[n]['fire'] = 0.1 # Start small
                              # Also add smoke
                              self.penalties[n]['smoke'] = 0.4
@@ -949,6 +949,7 @@ class MCASimulation:
             # (We already found current_max_penalty, but let's finding the ID)
             hazard_center = None
             max_p = -1
+            updates = {} # CRITICAL FIX: Initialize updates to prevent crash
             for cid in new_population:
                 if count > 0: # Check only occupied? Or all? 
                     # We need the source of the penalty, which might be empty now but was high.
@@ -1009,6 +1010,8 @@ class MCASimulation:
                     self.dijkstra_distances, _ = Dijkstra.calculate_dijkstra_field(
                         self.graph, self.safe_zone_cells, initial_costs=initial_costs
                     )
+                    # Global Recompute affects everyone
+                    updates = {n: self.dijkstra_distances.get(n, float('inf')) for n in self.graph.nodes}
             
             # Re-derive directions (PARTIAL UPDATE OPTIMIZATION)
             # Update directions for all nodes that were patched + their neighbors
@@ -1077,6 +1080,17 @@ class MCASimulation:
         for cid in self.graph.nodes:
             current_pop = new_population[cid]
             if current_pop <= 0: continue
+            
+            # DEBUG STUCK AGENTS (247, 248)
+            if cid in [247, 248] and current_pop > 0.5:
+                 tgt = self.directions.get(cid)
+                 print(f"DEBUG Cell {cid}: Pop {current_pop:.2f} -> Target {tgt}")
+                 if tgt is not None:
+                      t_cap = self.max_capacities.get(tgt, 0)
+                      t_pop = new_population.get(tgt, 0)
+                      print(f"      Target {tgt}: Pop {t_pop:.2f}/{t_cap:.2f} (Avail: {t_cap - t_pop:.2f})")
+                 else:
+                      print("      NO TARGET (Directions is None) - Local Minimum?")
                 
             target_id = self.directions.get(cid)
             if target_id is None:
@@ -1095,6 +1109,11 @@ class MCASimulation:
                          
                          new_population[cid] = max(0, new_population[cid] - actual_out)
                          step_exit_flow[exit_id] = step_exit_flow.get(exit_id, 0) + actual_out
+                         
+                         # NEW: Record Flow for Visualization
+                         if actual_out > 0.1:
+                             # Use a special target key for exit
+                             current_step_flows[(cid, 'EXIT')] = current_step_flows.get((cid, 'EXIT'), 0) + actual_out
                      else:
                          # LOCAL MINIMUM -> Stuck
                          # Agents remain here. do nothing.
@@ -1141,12 +1160,16 @@ class MCASimulation:
             actual_flow = max(0, actual_flow)
             actual_flow = min(actual_flow, current_pop)
             
+            if cid in [247, 248] and current_pop > 0.5:
+                 print(f"      Calculated Flow: {actual_flow:.4f} (q_out: {q_out:.4f})")
+            
             new_population[cid] -= actual_flow
             new_population[target_id] += actual_flow
             
             # Log Flow
-            if actual_flow > 0:
+            if actual_flow > 0.1:
                 current_step_flows[(cid, target_id)] = current_step_flows.get((cid, target_id), 0) + actual_flow
+                # if self.time_step % 50 == 0: print(f"DEBUG: Recorded Flow {cid}->{target_id}: {actual_flow}") # VERBOSE DEBUG
 
         # Commit buffered exit flow
         for eid, count in step_exit_flow.items():
@@ -1502,8 +1525,16 @@ class MCASimulation:
         self.current_frame = 0
         self.view_mode = 'occupancy' 
         self.remaining_artist = None
+        
+        # Optimize Exit Lookup (Cache Centroids)
+        self.exit_centroids_cache = {}
+        if self.exits is not None:
+             if isinstance(self.exits, gpd.GeoDataFrame):
+                  for idx, row in self.exits.iterrows():
+                      self.exit_centroids_cache[idx] = row.geometry.centroid
 
         # Pre-Compute Flow Vectors for Arrow Visualization
+
         self.flow_vectors = {}
         if hasattr(self, 'directions'):
             import math
@@ -1647,8 +1678,11 @@ class MCASimulation:
                     f"(Historical Accumulation)"
                 )
 
-        def update(frame):
+        def _update_unsafe(frame):
             self.current_frame = frame
+            # print(f"DEBUG: Animating Frame {frame}") # Reduce spam if user runs again
+            
+            # --- PHASE 1: DIJKSTRA FLOODFILL ---
             
             # --- PHASE 1: DIJKSTRA FLOODFILL ---
             # If we are in the intro phase, visualize the floodfill process
@@ -1662,9 +1696,10 @@ class MCASimulation:
                  # Hide Phase 2 Artifacts
                  self.scat_casualties.set_visible(False)
                  self.scat_penalties.set_visible(False)
+                 self.scat_casualties.set_visible(False)
+                 self.scat_penalties.set_visible(False)
                  if self.quiver: 
-                     self.quiver.remove()
-                     self.quiver = None
+                     self.quiver.set_visible(False)
                  
                  # Color Map for Floodfill
                  # 1. PRE-COMPUTED COLORS (Phase A - Multi-Source Field)
@@ -1731,7 +1766,9 @@ class MCASimulation:
                  self.scat_penalties.set_visible(False)
 
                  # RESET Facecolors (Critical fix for toggle persistence)
-                 collection.set_facecolors([]) # Empty list resets to use cmap array
+                 # collection.set_facecolors([])
+                 # NOTE: sending None allows set_array to work.
+                 collection.set_facecolors(None) 
                  collection.set_edgecolors('lightgray')
 
                  collection.set_cmap('turbo')
@@ -1745,43 +1782,51 @@ class MCASimulation:
                  collection.set_array(np.array(ratios))
                  collection.set_clim(0, 1.0)
                  
-                 # Dynamic Flow Arrows (Only where agents are)
+                 # Dynamic Flow Arrows (Historical Truth)
                  if self.quiver: self.quiver.remove()
                  xq, yq, uq, vq = [], [], [], []
                  
-                 # Get Dynamic Field for this frame
-                 d_map = self.dijkstra_distances # Default
-                 if hasattr(self, 'distance_history') and sim_frame < len(self.distance_history):
-                     d_map = self.distance_history[sim_frame]
+                 # Get Flows for this frame (Movement that happened FROM this state)
+                 if hasattr(self, 'flow_history') and sim_frame < len(self.flow_history):
+                     flows = self.flow_history[sim_frame]
+                     # DEBUG: Check if we have flows!
+                     if sim_frame > 0 and len(flows) == 0:
+                          if sim_frame % 50 == 0: print(f"DEBUG Frame {sim_frame}: NO FLOWS RECORDED!")
+                     elif sim_frame % 50 == 0:
+                          print(f"DEBUG Frame {sim_frame}: {len(flows)} active flows. Samples: {list(flows.keys())[:3]}")
+                     
+                     for (u, v), count in flows.items():
+                         if count > 0.0:
+                             start_pt = self.cell_centroids.get(u)
+                             end_pt = None
+                             
+                             if v == 'EXIT':
+                                  # Find which exit it is connected to
+                                 eid = self.road_to_exit.get(u)
+                                 # We need the geometry of the Exit or just point out
+                                 if eid is not None:
+                                      # Use Cached Exit Centroid
+                                      end_pt = self.exit_centroids_cache.get(eid)
+                                      
+                                      # Fallback: if not in cache (maybe index mismatch), verify
+                                      if end_pt is None:
+                                           # Try finding a near exit if strict ID failed? unneeded overhead.
+                                           pass
+                             else:
+                                 end_pt = self.cell_centroids.get(v)
+                             
+                             if start_pt and end_pt:
+                                 dx = end_pt.x - start_pt.x
+                                 dy = end_pt.y - start_pt.y
+                                 norm = np.hypot(dx, dy)
+                                 if norm > 0:
+                                     xq.append(start_pt.x)
+                                     yq.append(start_pt.y)
+                                     uq.append(dx/norm)
+                                     vq.append(dy/norm)
                  
-                 for idx, count in pop_data.items():
-                     if count > 1.0:
-                          centroid = self.cell_centroids.get(idx)
-                          # FIX: Derive Dynamic Vector from d_map
-                          # Find steepest descent neighbor in this frame's field
-                          best_n = None
-                          min_d = d_map.get(idx, float('inf'))
-                          
-                          # Gradient Search
-                          for n in self.graph.neighbors(idx):
-                              dn = d_map.get(n, float('inf'))
-                              if dn < min_d:
-                                  min_d = dn
-                                  best_n = n
-                                  
-                          if best_n:
-                              target_pt = self.cell_centroids[best_n]
-                              dx = target_pt.x - centroid.x
-                              dy = target_pt.y - centroid.y
-                              norm = np.hypot(dx, dy)
-                              if norm > 0:
-                                  xq.append(centroid.x)
-                                  yq.append(centroid.y)
-                                  uq.append(dx/norm)
-                                  vq.append(dy/norm)
-                               
                  if xq:
-                     self.quiver = ax.quiver(xq, yq, uq, vq, scale=30, width=0.003, color='black', alpha=0.6, zorder=6)
+                     self.quiver = ax.quiver(xq, yq, uq, vq, scale=30, width=0.003, color='black', alpha=0.8, zorder=20)
                  else:
                      self.quiver = None
  
@@ -1920,6 +1965,11 @@ class MCASimulation:
             status_line = ""
             if frame == len(self.history) - 1 and current_agents > 0:
                 status_line = f"\n⚠️ FINAL: {int(current_agents)} Agents Stranded (Magenta)"
+            
+            # Casualties THIS STEP (Feedback for disappearing agents)
+            cas_now = 0
+            if sim_frame > 0 and sim_frame < len(self.casualty_history):
+                cas_now = self.casualty_history[sim_frame] - self.casualty_history[sim_frame-1]
 
             info_text.set_text(
                 f"⏱️ Time: {sim_frame}s\n"
@@ -1929,8 +1979,24 @@ class MCASimulation:
                 f"{status_line}"
             )
             
+            if cas_now > 0:
+                 info_text.set_text(info_text.get_text() + f"\n⚠️ DYING: +{int(cas_now)}/s")
+                 info_text.set_bbox(dict(facecolor='#ffcccc', alpha=0.9, boxstyle='round,pad=0.5')) # Red Alert
+            else:
+                 info_text.set_bbox(dict(facecolor='white', alpha=0.9, boxstyle='round,pad=0.5'))
+            
             update_selection_text(frame)
             return collection, info_text, selected_cell_text
+
+        def update(frame):
+            try:
+                return _update_unsafe(frame)
+            except Exception as e:
+                print(f"!!! ANIMATION ERROR at Frame {frame}: {e}")
+                import traceback
+                traceback.print_exc()
+                # Return dummy values to keep animation alive if possible, or re-raise
+                return collection, info_text, selected_cell_text
 
 
 

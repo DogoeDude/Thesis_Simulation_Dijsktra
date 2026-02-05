@@ -737,6 +737,8 @@ class MCASimulation:
         
         self.per_cell_casualty_history = []
         self.per_cell_casualty_history.append(self.casualties_per_cell.copy())
+        
+        self.garbage = 0.0 # Track removed ghost agents
 
 
     def calculate_composite_score(self, cid, rho, fire_val):
@@ -777,9 +779,9 @@ class MCASimulation:
         Fire/Terrain do NOT decay here (managed by event/static).
         """
         # Decay Rates
-        DECAY_SMOKE = 0.03  # Faster Decay (was 0.01)
-        DECAY_DEBRIS = 0.01 # Faster Decay (was 0.005)
-        DECAY_TEMP = 0.1
+        DECAY_SMOKE = 0.1  # Faster Decay (was 0.03)
+        DECAY_DEBRIS = 0.1 # Faster Decay (was 0.01)
+        DECAY_TEMP = 0.2
         
         for cid, p_dict in self.penalties.items():
             # Decay
@@ -795,8 +797,8 @@ class MCASimulation:
             if p_dict['fire'] > 0:
                 if cid in self.burnt_cells:
                     # DECAY PHASE
-                    # User Request: "Decay is WAY too slow" -> Increased to 0.03
-                    p_dict['fire'] = max(0.0, p_dict['fire'] - 0.03)
+                    # User Request: "Decay is WAY too slow" -> Increased to 0.1
+                    p_dict['fire'] = max(0.0, p_dict['fire'] - 0.1)
                     if p_dict['fire'] == 0:
                         self.burnt_cells.remove(cid)
                 else:
@@ -814,7 +816,7 @@ class MCASimulation:
                     neighbors = list(self.graph.neighbors(cid))
                     for n in neighbors:
                          # 11% chance to ignite neighbor
-                         if self.penalties[n]['fire'] == 0 and random.random() < 0.14:
+                         if self.penalties[n]['fire'] == 0 and random.random() < 0.13:
                              self.penalties[n]['fire'] = 0.1 # Start small
                              # Also add smoke
                              self.penalties[n]['smoke'] = 0.4
@@ -1054,16 +1056,28 @@ class MCASimulation:
                 candidates = [n for n in self.graph.neighbors(node) 
                               if abs(source_field.get(n, float('inf')) - best_d_found) < 1e-5]
                 
-                # 3. Select Best
-                if candidates:
-                    # Stickiness: If current target is in the top tier, keep it.
-                    if current_target in candidates:
-                        best_neighbor = current_target
-                    else:
-                        # Tie-breaker: Pick one (First / deterministic)
-                        best_neighbor = candidates[0]
-                else:
-                    best_neighbor = None
+                # 3. Select Best with HYSTERESIS (Stickiness)
+                # Prevent oscillation by keeping current target if it's "good enough" (within 5% of best)
+                
+                best_neighbor = None
+                
+                # Check current target first
+                kept_current = False
+                if current_target is not None:
+                     # Check if it's still a valid neighbor
+                     if self.graph.has_edge(node, current_target):
+                          current_dist = source_field.get(current_target, float('inf'))
+                          # Hysteresis Factor: 1.50 (50% tolerance) - MAX STICKINESS
+                          if current_dist <= best_d_found * 1.50:
+                               best_neighbor = current_target
+                               kept_current = True
+                
+                # If we didn't keep current, pick the absolute best
+                if not kept_current:
+                     if candidates:
+                          best_neighbor = candidates[0] # Candidates are already those with min_dist
+                     else:
+                          best_neighbor = None
                 
                 self.directions[node] = best_neighbor
 
@@ -1081,16 +1095,7 @@ class MCASimulation:
             current_pop = new_population[cid]
             if current_pop <= 0: continue
             
-            # DEBUG STUCK AGENTS (247, 248)
-            if cid in [247, 248] and current_pop > 0.5:
-                 tgt = self.directions.get(cid)
-                 print(f"DEBUG Cell {cid}: Pop {current_pop:.2f} -> Target {tgt}")
-                 if tgt is not None:
-                      t_cap = self.max_capacities.get(tgt, 0)
-                      t_pop = new_population.get(tgt, 0)
-                      print(f"      Target {tgt}: Pop {t_pop:.2f}/{t_cap:.2f} (Avail: {t_cap - t_pop:.2f})")
-                 else:
-                      print("      NO TARGET (Directions is None) - Local Minimum?")
+            # DEBUG STUCK AGENTS REMOVED
                 
             target_id = self.directions.get(cid)
             if target_id is None:
@@ -1111,7 +1116,7 @@ class MCASimulation:
                          step_exit_flow[exit_id] = step_exit_flow.get(exit_id, 0) + actual_out
                          
                          # NEW: Record Flow for Visualization
-                         if actual_out > 0.1:
+                         if actual_out > 0.05:
                              # Use a special target key for exit
                              current_step_flows[(cid, 'EXIT')] = current_step_flows.get((cid, 'EXIT'), 0) + actual_out
                      else:
@@ -1161,13 +1166,13 @@ class MCASimulation:
             actual_flow = min(actual_flow, current_pop)
             
             if cid in [247, 248] and current_pop > 0.5:
-                 print(f"      Calculated Flow: {actual_flow:.4f} (q_out: {q_out:.4f})")
-            
+                 pass # Debug Removed
+
             new_population[cid] -= actual_flow
             new_population[target_id] += actual_flow
             
             # Log Flow
-            if actual_flow > 0.1:
+            if actual_flow > 0.05:
                 current_step_flows[(cid, target_id)] = current_step_flows.get((cid, target_id), 0) + actual_flow
                 # if self.time_step % 50 == 0: print(f"DEBUG: Recorded Flow {cid}->{target_id}: {actual_flow}") # VERBOSE DEBUG
 
@@ -1176,6 +1181,14 @@ class MCASimulation:
             self.exit_usage[eid] += count
 
         self.population = new_population
+        
+        # Population Hygiene (Remove Ghosts)
+        for cid in list(self.population.keys()):
+            if self.population[cid] < 0.05:
+                removed_amount = self.population[cid]
+                self.garbage += removed_amount
+                self.population[cid] = 0.0
+
         self.flow_history.append(current_step_flows)
         self.time_step += 1
         return sum(self.population.values())
@@ -1437,6 +1450,9 @@ class MCASimulation:
         print(f"  Remaining:     {total_remaining:.0f}")
         print(f"  Evacuated:     {total_evacuated:.0f}")
         print(f"  Dead:          {total_dead:.0f}")
+        print(f"  Ghost Cleaned: {self.garbage:.2f}")
+        
+        final_total = total_remaining + total_evacuated + total_dead + self.garbage
         print(f"  Calculated Sum:{final_total:.0f}")
         print(f"  DISCREPANCY:   {self.total_agents_init - final_total:.2f}")
         
@@ -1550,7 +1566,7 @@ class MCASimulation:
         
         # Visualization for Casualties (Markers)
         # We use a scatter plot to show 'X' marks where deaths occur
-        self.scat_casualties = ax.scatter([], [], marker='x', s=100, color='red', linewidth=2.0, zorder=30) 
+        self.scat_casualties = ax.scatter([], [], marker='s', s=120, color='red', alpha=0.6, zorder=30, label='Casualties') 
         # NEW: Scatter for Penalties (Orange Squares)
         self.scat_penalties = ax.scatter([], [], marker='s', s=120, color='orange', alpha=0.6, zorder=35, label='Hazards') 
 

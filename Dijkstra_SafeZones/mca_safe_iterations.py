@@ -520,6 +520,171 @@ class MCASimulation:
                     best_neighbor = neighbor
             
             self.directions[node] = best_neighbor
+
+        # Identify cells unreachable from any exit
+        self.unreachable_cells = set()
+        for node in self.graph.nodes:
+            if node not in exit_indices and self.directions.get(node) is None:
+                d_safe = self.dijkstra_distances.get(node, float('inf'))
+                d_exit = self.dist_to_exit.get(node, float('inf'))
+                if d_safe == float('inf') and d_exit == float('inf'):
+                    self.unreachable_cells.add(node)
+
+        if self.unreachable_cells:
+            print(f"  - WARNING: {len(self.unreachable_cells)} cells are UNREACHABLE from any exit: {sorted(self.unreachable_cells)}")
+            print(f"    Agents will NOT be spawned on these cells.")
+        
+        # ---------------------------------------------------------
+        # 3. CONNECTIVITY REPAIR (Safeguard for Dijkstra)
+        # ---------------------------------------------------------
+        # Even with Dijkstra, small disconnected islands might exist.
+        # This BFS repair ensures ALL agents have a valid path to the main network.
+
+        print("  - Validating flow connectivity...")
+        
+        # A. Identify Independent Valid Set
+        valid_flow_nodes = set(exit_indices)
+        
+        # Reverse flow mapping
+        reverse_flow = {u: [] for u in self.graph.nodes}
+        for u, v in self.directions.items():
+            if v is not None:
+                if v not in reverse_flow: reverse_flow[v] = []
+                reverse_flow[v].append(u)
+        
+        # BFS from exits backwards
+        visited = set(exit_indices)
+        import collections
+        q = collections.deque(exit_indices)
+        
+        while q:
+            curr = q.popleft()
+            sources = reverse_flow.get(curr, [])
+            for src in sources:
+                if src not in visited:
+                    visited.add(src)
+                    q.append(src)
+        
+        valid_flow_nodes = visited
+        stuck_nodes = [n for n in self.graph.nodes if n not in valid_flow_nodes and n not in exit_indices]
+        
+        if stuck_nodes:
+            print(f"  - DETECTED {len(stuck_nodes)} STRANDED CELLS. Repairing...")
+            
+            # B. Repair Plan: BFS from Valid Set
+            q_repair = collections.deque(valid_flow_nodes)
+            dist_to_valid = {n: 0 for n in valid_flow_nodes}
+            
+            while q_repair:
+                curr = q_repair.popleft()
+                current_dist = dist_to_valid[curr]
+                
+                for nbr in self.graph.neighbors(curr):
+                    if nbr not in dist_to_valid:
+                        dist_to_valid[nbr] = current_dist + 1
+                        q_repair.append(nbr)
+            
+            # C. Re-assign directions
+            fixed_count = 0
+            for nid in stuck_nodes:
+                best_fix = None
+                best_fix_dist = float('inf')
+                
+                neighbors = list(self.graph.neighbors(nid))
+                # Hybrid distance tie-breaker
+                neighbors.sort(key=lambda x: self.dijkstra_distances.get(x, float('inf')))
+                
+                for nbr in neighbors:
+                    d = dist_to_valid.get(nbr, float('inf'))
+                    if d < best_fix_dist:
+                        best_fix_dist = d
+                        best_fix = nbr
+                
+                if best_fix is not None:
+                    self.directions[nid] = best_fix
+                    fixed_count += 1
+                else:
+                    self.directions[nid] = None
+            
+            print(f"  - REPAIRED {fixed_count} cells. Agents will now flow to validity.")
+        else:
+            print("  - Flow check passed. All cells have valid paths.")
+
+        
+        # ---------------------------------------------------------
+        # 3. CONNECTIVITY REPAIR (Safeguard for Dijkstra)
+        # ---------------------------------------------------------
+        # Even with Dijkstra, small disconnected islands might exist.
+        # This BFS repair ensures ALL agents have a valid path to the main network.
+
+        print("  - Validating flow connectivity...")
+        
+        # A. Identify Independent Valid Set
+        valid_flow_nodes = set(exit_indices)
+        
+        # Reverse flow mapping
+        reverse_flow = {u: [] for u in self.graph.nodes}
+        for u, v in self.directions.items():
+            if v is not None:
+                if v not in reverse_flow: reverse_flow[v] = []
+                reverse_flow[v].append(u)
+        
+        # BFS from exits backwards
+        visited = set(exit_indices)
+        import collections
+        q = collections.deque(exit_indices)
+        
+        while q:
+            curr = q.popleft()
+            sources = reverse_flow.get(curr, [])
+            for src in sources:
+                if src not in visited:
+                    visited.add(src)
+                    q.append(src)
+        
+        valid_flow_nodes = visited
+        stuck_nodes = [n for n in self.graph.nodes if n not in valid_flow_nodes and n not in exit_indices]
+        
+        if stuck_nodes:
+            print(f"  - DETECTED {len(stuck_nodes)} STRANDED CELLS. Repairing...")
+            
+            # B. Repair Plan: BFS from Valid Set
+            q_repair = collections.deque(valid_flow_nodes)
+            dist_to_valid = {n: 0 for n in valid_flow_nodes}
+            
+            while q_repair:
+                curr = q_repair.popleft()
+                current_dist = dist_to_valid[curr]
+                
+                for nbr in self.graph.neighbors(curr):
+                    if nbr not in dist_to_valid:
+                        dist_to_valid[nbr] = current_dist + 1
+                        q_repair.append(nbr)
+            
+            # C. Re-assign directions
+            fixed_count = 0
+            for nid in stuck_nodes:
+                best_fix = None
+                best_fix_dist = float('inf')
+                
+                neighbors = list(self.graph.neighbors(nid))
+                neighbors.sort(key=lambda x: self.dijkstra_distances.get(x, float('inf')))
+                
+                for nbr in neighbors:
+                    d = dist_to_valid.get(nbr, float('inf'))
+                    if d < best_fix_dist:
+                        best_fix_dist = d
+                        best_fix = nbr
+                
+                if best_fix is not None:
+                    self.directions[nid] = best_fix
+                    fixed_count += 1
+                else:
+                    self.directions[nid] = None
+            
+            print(f"  - REPAIRED {fixed_count} cells. Agents will now flow to validity.")
+        else:
+            print("  - Flow check passed. All cells have valid paths.")
         
         # OVERRIDE: BRIDGE SAFE ZONES TO EXITS
         if hasattr(self, 'safe_path_nodes'):
@@ -557,7 +722,11 @@ class MCASimulation:
             spawn_buffer = self.spawns.buffer(5.0)
             for idx, cell in self.road_cells.iterrows():
                 if spawn_buffer.intersects(cell.geometry).any():
-                    source_ids.append(cell['id'])
+                    cid = cell['id']
+                    # Skip cells unreachable from exits
+                    if hasattr(self, 'unreachable_cells') and cid in self.unreachable_cells:
+                        continue
+                    source_ids.append(cid)
             
             if source_ids:
                 # Randomize distribution
@@ -745,6 +914,7 @@ class MCASimulation:
             # Find the center of the hazard (cell with max penalty)
             best_center = None
             best_score = -1
+            updates = {} # CRITICAL FIX: Initialize updates to prevent crash
             
             for cid in self.graph.nodes:
                 p_dict = self.penalties[cid]
@@ -778,6 +948,11 @@ class MCASimulation:
                     initial_costs[sz] = d
                     
                 if self.safe_zone_cells:
+                    self.dijkstra_distances, _ = Dijkstra.calculate_dijkstra_field(
+                        self.graph, self.safe_zone_cells, initial_costs=initial_costs
+                    )
+                    # Global Recompute affects everyone
+                    updates = {n: self.dijkstra_distances.get(n, float('inf')) for n in self.graph.nodes}
                     self.dijkstra_distances, _ = Dijkstra.calculate_dijkstra_field(
                         self.graph, self.safe_zone_cells, initial_costs=initial_costs
                     )

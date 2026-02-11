@@ -2,7 +2,7 @@
 MCA Evacuation Simulation
 Based on "Simulation method of urban evacuation based on mesoscopic cellular automata"
 """
-
+#Base with Penalty
 import geopandas as gpd
 import pandas as pd
 import numpy as np
@@ -61,6 +61,7 @@ class MCASimulation:
         self.history = []
         self.casualty_history = []
         self.per_cell_casualty_history = [] # LIST of DICTS: [ {cell_id: death_count}, ... ]
+        self.penalty_history = []           # LIST of DICTS: [ {cell_id: score}, ... ]
         
         # Exit Analysis
         self.exit_status = {} # exit_id -> 'OPEN'/'CLOSED'
@@ -71,6 +72,22 @@ class MCASimulation:
         # Viz Data
         self.cell_centroids = {}
         self.flow_vectors = {} # cell_idx -> (u, v)
+
+        # ----------------------------------------------------------------
+        # HAZARD-AWARE PARAMETERS (From Safe Zone Logic)
+        # ----------------------------------------------------------------
+        # 1. Weights (Influence on Speed/Routing)
+        self.W_FIRE = 1.0
+        self.W_SMOKE = 0.8
+        self.W_DENSITY = 0.6
+        self.W_DEBRIS = 0.4
+        self.W_TERRAIN = 0.2
+        self.W_TEMP_OBJ = 0.2
+        
+        # 2. State
+        self.penalties = {} 
+        self.current_max_penalty = 0.0
+        self.burnt_cells = set() # Track cells that have peaked/decayed
 
     def load_data(self):
         # ... (unchanged code for load_data) ...
@@ -230,6 +247,12 @@ class MCASimulation:
             # Initialize tracker
             self.casualties_per_cell[cid] = 0.0
             
+            # Initialize Penalties
+            self.penalties[cid] = {
+                'fire': 0.0, 'smoke': 0.0, 'debris': 0.0, 
+                'terrain': 0.0, 'temp': 0.0
+            }
+            
         for idx_left, row in joins.iterrows():
             id_l = self.road_cells.iloc[idx_left]['id']
             id_r = self.road_cells.iloc[row['index_right']]['id']
@@ -298,33 +321,8 @@ class MCASimulation:
             # Assign fallback ID
             for i in ids: self.road_to_exit[i] = 999 
 
-        # SPECIAL HANDLING: Map CLOSED exits to nearest cell for counting/SDF
-        # as per user requirement (count evacuees even if "closed" visually)
-        for eid, status in self.exit_status.items():
-            if status == 'CLOSED':
-                exit_geom = self.exits.loc[eid].geometry
-                
-                # Find nearest road cell
-                min_dist = float('inf')
-                nearest_id = None
-                
-                # Iterate all road cells - could be slow, but safe
-                # Optimization: Use cell_centroids
-                for cid, pt in self.cell_centroids.items():
-                    d = pt.distance(exit_geom)
-                    if d < min_dist:
-                        min_dist = d
-                        nearest_id = cid
-                
-                if nearest_id is not None:
-                    # Treat as valid exit for SDF and Counting
-                    if nearest_id not in exit_indices:
-                        exit_indices.append(nearest_id)
-                    
-                    # Map for stats (Overwrites if multiple, but acceptable)
-                    self.road_to_exit[nearest_id] = eid
-                    
-                    print(f"DEBUG: Mapping CLOSED Exit {eid} to nearest cell {nearest_id} (Dist: {min_dist:.1f}m) for counting.")
+        # CLOSED exits are NOT added to exit_indices.
+        # Only genuinely OPEN exits (those intersecting road cells) act as sinks.
 
         # Static Distance Field (Euclidean)
         print("  - Calculating Static Distance Field (Euclidean)...")
@@ -390,6 +388,110 @@ class MCASimulation:
                 
         if local_minima_count > 0:
             print(f"  - WARNING: {local_minima_count} cells are in Local Minima (no neighbor is closer to exit). Flow may stop there.")
+
+        # Identify cells unreachable from any exit
+        self.unreachable_cells = set()
+        for nid in valid_nodes:
+            if nid not in exit_indices and self.directions.get(nid) is None:
+                if distances.get(nid, float('inf')) == float('inf'):
+                    self.unreachable_cells.add(nid)
+
+        if self.unreachable_cells:
+            print(f"  - WARNING: {len(self.unreachable_cells)} cells are UNREACHABLE from any exit: {sorted(self.unreachable_cells)}")
+            print(f"    Agents will NOT be spawned on these cells.")
+
+        # ---------------------------------------------------------
+        # 3. CONNECTIVITY REPAIR (Fixing Euclidean Dead Ends)
+        # ---------------------------------------------------------
+        # Euclidean distance often leads to dead ends (local minima) that are "close" to exits
+        # but topologically disconnected. We fix this by validating chains.
+
+        print("  - Validating flow connectivity...")
+        
+        # A. Identify Independent Valid Set (Nodes that actually reach an exit)
+        valid_flow_nodes = set(exit_indices)
+        
+        # Iterative propagation (reverse flow)
+        # We want to find all nodes u such that directions[u] -> ... -> exit
+        # Since we have N nodes, a loop is at most N steps. But efficient way is reverse graph.
+        
+        # Build reverse mapping: target -> [sources]
+        reverse_flow = {u: [] for u in valid_nodes}
+        for u, v in self.directions.items():
+            if v is not None:
+                if v not in reverse_flow: reverse_flow[v] = []
+                reverse_flow[v].append(u)
+        
+        # BFS from exits backwards
+        queue = list(exit_indices)
+        visited = set(exit_indices)
+        
+        import collections
+        q = collections.deque(exit_indices)
+        
+        while q:
+            curr = q.popleft()
+            # All nodes pointing TO curr are valid
+            sources = reverse_flow.get(curr, [])
+            for src in sources:
+                if src not in visited:
+                    visited.add(src)
+                    q.append(src)
+        
+        valid_flow_nodes = visited
+        stuck_nodes = [n for n in valid_nodes if n not in valid_flow_nodes]
+        
+        if stuck_nodes:
+            print(f"  - DETECTED {len(stuck_nodes)} STRANDED CELLS (Euclidean Local Minima). Repairing...")
+            
+            # B. Repair Plan: BFS from Valid Set to find nearest valid node
+            # This makes stuck agents flow towards the "Valid Network"
+            
+            # BFS for distance to valid network
+            # distance_to_valid[node] = hops
+            
+            # Initialize with valid set
+            q_repair = collections.deque(valid_flow_nodes)
+            dist_to_valid = {n: 0 for n in valid_flow_nodes}
+            
+            # Run BFS on the ROAD GRAPH (undirected)
+            while q_repair:
+                curr = q_repair.popleft()
+                current_dist = dist_to_valid[curr]
+                
+                for nbr in self.graph.neighbors(curr):
+                    if nbr not in dist_to_valid:
+                        dist_to_valid[nbr] = current_dist + 1
+                        q_repair.append(nbr)
+            
+            # C. Re-assign directions for stuck nodes
+            fixed_count = 0
+            for nid in stuck_nodes:
+                # Find neighbor with strictly smaller dist_to_valid
+                my_dist = dist_to_valid.get(nid, float('inf'))
+                best_fix = None
+                best_fix_dist = my_dist
+                
+                neighbors = list(self.graph.neighbors(nid))
+                # Sort by Euclidean distance as tie-breaker (preserve original logic preference)
+                neighbors.sort(key=lambda x: distances.get(x, float('inf')))
+                
+                for nbr in neighbors:
+                    d = dist_to_valid.get(nbr, float('inf'))
+                    if d < best_fix_dist:
+                        best_fix_dist = d
+                        best_fix = nbr
+                
+                if best_fix is not None:
+                    self.directions[nid] = best_fix
+                    fixed_count += 1
+                else:
+                    # Still stuck? Probably totally disconnected component
+                    self.directions[nid] = None
+            
+            print(f"  - REPAIRED {fixed_count} cells. Agents will now flow to validity.")
+        else:
+            print("  - Flow check passed. All cells have valid paths.")
         
         # Pre-calc flow vectors
         for idx, target_idx in self.directions.items():
@@ -418,7 +520,11 @@ class MCASimulation:
             spawn_buffer = self.spawns.buffer(5.0)
             for idx, cell in self.road_cells.iterrows():
                 if spawn_buffer.intersects(cell.geometry).any():
-                    source_ids.append(cell['id'])
+                    cid = cell['id']
+                    # Skip cells unreachable from exits
+                    if hasattr(self, 'unreachable_cells') and cid in self.unreachable_cells:
+                        continue
+                    source_ids.append(cid)
             
             if source_ids:
                 # Randomize distribution
@@ -451,7 +557,90 @@ class MCASimulation:
         self.per_cell_casualty_history = [] # RESET
         self.per_cell_casualty_history.append(self.casualties_per_cell.copy())
 
+        # Initial Penalties (Step 0)
+        p0 = {}
+        for cid in self.graph.nodes:
+            fire_val = self.penalties[cid]['fire']
+            p0[cid] = self.calculate_composite_score(cid, self.population[cid]/self.cell_areas.get(cid,60.0), fire_val)
+        self.penalty_history = [p0]
+
+    def calculate_composite_score(self, cid, rho, fire_val):
+        """
+        Computes clamped composite penalty score for a cell.
+        S = min(0.95, weighted_sum)
+        """
+        p = self.penalties.get(cid)
+        if not p: return 0.0
+
+        val_density = min(1.0, rho / self.STAMPEDE_DENSITY) if self.STAMPEDE_DENSITY > 0 else 0
+        
+        val_fire = min(1.0, p['fire'])
+        val_smoke = min(1.0, p['smoke'])
+        val_debris = min(1.0, p['debris'])
+        val_terrain = min(1.0, p['terrain'])
+        val_temp = min(1.0, p['temp'])
+        
+        w_sum = (val_fire * self.W_FIRE) + \
+                (val_smoke * self.W_SMOKE) + \
+                (val_density * self.W_DENSITY) + \
+                (val_debris * self.W_DEBRIS) + \
+                (val_terrain * self.W_TERRAIN) + \
+                (val_temp * self.W_TEMP_OBJ)
+                
+        return min(0.95, w_sum)
+
+    def update_penalties(self):
+        """
+        Decay dynamics for transient penalties.
+        Fire/Terrain do NOT decay here (managed by event/static).
+        """
+        # Decay Rates
+        DECAY_SMOKE = 0.03  # Faster Decay (was 0.01)
+        DECAY_DEBRIS = 0.01 # Faster Decay (was 0.005)
+        DECAY_TEMP = 0.1
+        
+        for cid, p_dict in self.penalties.items():
+            # Decay
+            if p_dict['smoke'] > 0:
+                p_dict['smoke'] = max(0.0, p_dict['smoke'] - DECAY_SMOKE)
+            if p_dict['debris'] > 0:
+                p_dict['debris'] = max(0.0, p_dict['debris'] - DECAY_DEBRIS)
+            if p_dict['temp'] > 0:
+                p_dict['temp'] = max(0.0, p_dict['temp'] - DECAY_TEMP)
+            
+            # Fire Logic (Simple Propagation with Lifecycle)
+            import random
+            if p_dict['fire'] > 0:
+                if cid in self.burnt_cells:
+                    # DECAY PHASE
+                    # User Request: "Decay is WAY too slow" -> Increased to 0.03
+                    p_dict['fire'] = max(0.0, p_dict['fire'] - 0.03)
+                    if p_dict['fire'] == 0:
+                        self.burnt_cells.remove(cid)
+                else:
+                    # GROWTH PHASE
+                    if p_dict['fire'] < 1.0:
+                        p_dict['fire'] = min(1.0, p_dict['fire'] + 0.01) # Slower Growth (was 0.05)
+                    else:
+                        # Reached Peak -> Start Burnout (Switch to Decay)
+                        # Increased burnout chance to 10% (So it actually dies out)
+                        if random.random() < 0.10: 
+                            self.burnt_cells.add(cid)
+                
+                # ADJUSTED: Threshold 0.2, Chance 5% (Very Slow Spread, contained)
+                if p_dict['fire'] > 0.2 and cid not in self.burnt_cells:
+                    neighbors = list(self.graph.neighbors(cid))
+                    for n in neighbors:
+                        # 5% chance to ignite neighbor (reliable spread, but slow growth)
+                        if self.penalties[n]['fire'] == 0 and random.random() < 0.05:
+                            self.penalties[n]['fire'] = 0.1 # Start VERY small (needs ~10 steps to become dangerous)
+                            # Also add smoke
+                            self.penalties[n]['smoke'] = 0.6
+
     def step(self):
+        # 0. Update Dynamics
+        self.update_penalties()
+
         new_population = self.population.copy()
         total_deaths_this_step = 0
         
@@ -504,7 +693,15 @@ class MCASimulation:
             cap = self.max_capacities.get(cid, 300.0)
             
             rho_i = current_pop / area if area > 0 else 0
-            v_i = self.V_FREE * np.exp(-rho_i / self.RHO_MAX)
+            
+            # HAZARD LOGIC (Penalty Slowdown)
+            # Compute penalty score locally
+            fire_val = self.penalties[cid]['fire']
+            penalty_score = self.calculate_composite_score(cid, rho_i, fire_val)
+            
+            # Speed with Density + Hazard Penalty
+            # v = v_free * exp(-rho/rho_max) * (1 - penalty)
+            v_i = self.V_FREE * np.exp(-rho_i / self.RHO_MAX) * (1.0 - penalty_score)
             
             # Q = rho * v * w * dt
             # Use fixed width approx or derive from area/len
@@ -526,7 +723,7 @@ class MCASimulation:
         self.time_step += 1
         return sum(self.population.values())
 
-    def export_to_excel(self, filename="simulation_results_base_2.xlsx"):
+    def export_to_excel(self, filename="simulation_results_base_1.xlsx"):
         print(f"Exporting results to {filename}...")
         
         # 1. Time Series Data (Step-by-Step)
@@ -581,13 +778,13 @@ class MCASimulation:
                 
             time_data.append({
                 'Time (s)': t * self.DT,
-                'Exit Flow Rate': int(flow_step), # Round to int
-                'Remaining Evacuees': int(total_alive), # Round to int
+                'Exit Flow Rate': int(flow_step), # Flow is usually discrete count, but ok to keep int or float. request was casualties/remaining.
+                'Remaining Evacuees': total_alive,
                 'Density Evolution': avg_density,
                 'Velocity of Evacuees': avg_speed,
                 # Extra internal metrics kept for utility but renamed if needed
                 'Peak Density': max_rho, 
-                'Cumulative Casualties': int(cas_count) # Round to int
+                'Cumulative Casualties': cas_count
             })
             
         df_time = pd.DataFrame(time_data)
@@ -601,7 +798,7 @@ class MCASimulation:
             
             cell_data.append({
                 'Cell ID': cid,
-                'Spatial Distribution (Casualties)': int(final_deaths), # Round to int
+                'Spatial Distribution (Casualties)': final_deaths,
                 'Area': area,
                 'Status': 'BLOCKED' if cid in self.blocked_cells else 'OPEN'
             })
@@ -624,23 +821,58 @@ class MCASimulation:
         if self.history[-1] and sum(self.history[-1].values()) == 0:
              # Find exact step it became 0
              for t, pop in enumerate(self.history):
-                 if sum(pop.values()) == 0:
+                if sum(pop.values()) == 0:
                      final_time = t * self.DT
                      break
         
         df_summary = pd.DataFrame([{
             'Total Evacuation Time': final_time,
-            'Total Casualties': int(self.casualties) # Round to int
+            'Total Casualties': self.casualties,
+            'Total Evacuated': int(sum(self.exit_usage.values())),
+            'Remaining Agents': sum(self.history[-1].values())
         }])
 
         # WRITE TO EXCEL
         try:
+            # STYLING FUNCTION
+            def color_columns(s):
+                # s is a Series (column)
+                c_gray, c_red = 'background-color: #e0e0e0', 'background-color: #ffcccb'
+                c_green, c_blue = 'background-color: #d0f0c0', 'background-color: #add8e6'
+                c_yellow = 'background-color: #ffffe0'
+                
+                name = str(s.name)
+                if 'Casualties' in name or 'Remaining' in name or 'Deaths' in name: return [c_red] * len(s)
+                elif 'Evacuated' in name or 'Flow' in name or 'Usage' in name: return [c_green] * len(s)
+                elif 'Density' in name or 'Velocity' in name or 'Area' in name or 'Speed' in name: return [c_blue] * len(s)
+                elif 'Time' in name: return [c_yellow] * len(s)
+                return [''] * len(s)
+
             with pd.ExcelWriter(filename, engine='openpyxl') as writer:
-                df_time.to_excel(writer, sheet_name='Time Metrics', index=False)
-                df_cells.to_excel(writer, sheet_name='Spatial Distribution', index=False)
-                df_exits.to_excel(writer, sheet_name='Exit Usage', index=False)
-                df_summary.to_excel(writer, sheet_name='Summary', index=False)
-            print(f"✅ Simulation results saved to {filename}")
+                try:
+                    # Attempt to apply styles
+                    df_time.style.apply(color_columns, axis=0).to_excel(writer, sheet_name='Time Metrics', index=False)
+                    df_cells.sort_values(by='Spatial Distribution (Casualties)', ascending=False).style.apply(color_columns, axis=0).to_excel(writer, sheet_name='Spatial Distribution', index=False)
+                    df_exits.style.apply(color_columns, axis=0).to_excel(writer, sheet_name='Exit Usage', index=False)
+                    df_summary.style.apply(color_columns, axis=0).to_excel(writer, sheet_name='Summary', index=False)
+                    print(f"✅ Simulation results saved to {filename} (Colored)")
+                except ImportError:
+                    # Fallback if jinja2 missing
+                    print(f"⚠️ Styling failed (missing dependency). Saving unstyled version...")
+                    df_time.to_excel(writer, sheet_name='Time Metrics', index=False)
+                    df_cells.to_excel(writer, sheet_name='Spatial Distribution', index=False)
+                    df_exits.to_excel(writer, sheet_name='Exit Usage', index=False)
+                    df_summary.to_excel(writer, sheet_name='Summary', index=False)
+                    print(f"✅ Simulation results saved to {filename} (Unstyled)")
+                except Exception as e:
+                    # General fallback
+                    print(f"⚠️ Styling error: {e}. Saving unstyled version...")
+                    df_time.to_excel(writer, sheet_name='Time Metrics', index=False)
+                    df_cells.to_excel(writer, sheet_name='Spatial Distribution', index=False)
+                    df_exits.to_excel(writer, sheet_name='Exit Usage', index=False)
+                    df_summary.to_excel(writer, sheet_name='Summary', index=False)
+                    print(f"✅ Simulation results saved to {filename} (Unstyled)")
+
         except Exception as e:
             print(f"❌ Failed to save Excel: {e}")
 
@@ -662,6 +894,13 @@ class MCASimulation:
             self.casualty_history.append(self.casualties)
             self.per_cell_casualty_history.append(self.casualties_per_cell.copy())
             self.exit_usage_history.append(self.exit_usage.copy())
+
+            # Log Penalties
+            p_step = {}
+            for cid in self.graph.nodes:
+                fire_val = self.penalties[cid]['fire']
+                p_step[cid] = self.calculate_composite_score(cid, self.population[cid]/self.cell_areas.get(cid,60.0), fire_val)
+            self.penalty_history.append(p_step)
             
             if (t + 1) % 10 == 0:
                 curr_evac = sum(self.exit_usage.values())
@@ -694,108 +933,10 @@ class MCASimulation:
             print("  No casualties reported.")
         print("="*40 + "\n")
         
-        # Don't auto-export in loop. Main will handle it.
-        # self.export_to_excel()
-
-    def generate_results_dataframes(self):
-        # 1. Time Series Data (Step-by-Step)
-        time_data = []
-        
-        # Pre-calculate cell parameters for speed calc
-        cell_params = {}
-        for idx, row in self.road_cells.iterrows():
-            cid = row['id']
-            area = self.cell_areas.get(cid, 60.0)
-            cell_params[cid] = area
-
-        for t, (pop_map, cas_count) in enumerate(zip(self.history, self.casualty_history)):
-            # Global Stats
-            total_alive = sum(pop_map.values())
-            
-            # Avg Density & Speed Estimate
-            total_weighted_speed = 0
-            total_density = 0
-            occupied_cells = 0
-            
-            max_rho = 0
-            
-            for cid, count in pop_map.items():
-                if count > 0:
-                    area = cell_params.get(cid, 60.0)
-                    rho = count / area
-                    
-                    v_ratio = max(0.0, 1.0 - (rho / self.RHO_MAX))
-                    speed = self.V_FREE * v_ratio
-                    
-                    total_weighted_speed += speed * count
-                    total_density += rho
-                    occupied_cells += 1
-                    
-                    if rho > max_rho: max_rho = rho
-            
-            avg_speed = (total_weighted_speed / total_alive) if total_alive > 0 else 0
-            avg_density = (total_density / occupied_cells) if occupied_cells > 0 else 0
-            
-            # Exit Flow Rate (Agents per step)
-            current_usage = self.exit_usage_history[t] if t < len(self.exit_usage_history) else self.exit_usage
-            if t > 0:
-                prev_usage = self.exit_usage_history[t-1]
-                flow_step = sum(current_usage.values()) - sum(prev_usage.values())
-            else:
-                flow_step = 0
-                
-            time_data.append({
-                'Time (s)': t * self.DT,
-                'Exit Flow Rate': int(flow_step),
-                'Remaining Evacuees': total_alive,
-                'Density Evolution': avg_density,
-                'Velocity of Evacuees': avg_speed,
-                'Peak Density': max_rho, 
-                'Cumulative Casualties': cas_count
-            })
-            
-        df_time = pd.DataFrame(time_data)
-        
-        # 2. Spatial Distribution
-        cell_data = []
-        for cid in self.road_cells['id']:
-            final_deaths = self.casualties_per_cell.get(cid, 0)
-            area = self.cell_areas.get(cid, 60.0)
-            cap = self.max_capacities.get(cid, 0)
-            
-            cell_data.append({
-                'Cell ID': cid,
-                'Spatial Distribution (Casualties)': final_deaths,
-                'Area': area,
-                'Status': 'BLOCKED' if cid in self.blocked_cells else 'OPEN'
-            })
-        df_cells = pd.DataFrame(cell_data).sort_values(by='Spatial Distribution (Casualties)', ascending=False)
-        
-        # 3. Exit Usage
-        exit_data = []
-        for eid, count in self.exit_usage.items():
-            status = self.exit_status.get(eid, 'UNKNOWN')
-            exit_data.append({
-                'Exit ID': eid,
-                'Exit Usage Distribution': int(count),
-                'Status': status
-            })
-        df_exits = pd.DataFrame(exit_data)
-        
-        # 4. Summary
-        final_time = (len(self.history) - 1) * self.DT
-        if self.history[-1] and sum(self.history[-1].values()) == 0:
-             for t, pop in enumerate(self.history):
-                 if sum(pop.values()) == 0:
-                     final_time = t * self.DT
-                     break
-        
-        df_summary = pd.DataFrame([{
-            'Total Evacuation Time': final_time,
-            'Total Casualties': int(self.casualties)
-        }])
-        
-        return df_time, df_cells, df_exits, df_summary
+        # Export Data
+        import os
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.export_to_excel(filename=os.path.join(script_dir, "simulation_results_base_penalty_1.xlsx"))
                 
     def animate_results(self):
         print("Preparing animation...")
@@ -920,6 +1061,8 @@ class MCASimulation:
                     f"(Historical Accumulation)"
                 )
 
+        self.remaining_artist = None # To track the overlay
+
         def update(frame):
             self.current_frame = frame
             pop_data = self.history[frame]
@@ -954,9 +1097,48 @@ class MCASimulation:
                     self.quiver = ax.quiver(xq, yq, uq, vq, scale=30, width=0.003, color='black', alpha=0.6, zorder=6)
                 else:
                     self.quiver = None
+                
+                # Highlight Remaining Agents (Only on Last Frame)
+                if self.remaining_artist:
+                    try:
+                        self.remaining_artist.remove() # Clear previous
+                    except: pass 
+                    self.remaining_artist = None
+
+                # Check if this is the final frame
+                if frame == len(self.history) - 1:
+                    remaining_ids = [k for k, v in pop_data.items() if v > 0.1] # Threshold to avoid float dust
                     
-            else:
+                    # DEBUG: Print remaining breakdown
+                    print(f"\n[Frame {frame}] Visualization Debug:")
+                    print(f"  Total Agents Left: {sum(pop_data.values()):.2f}")
+                    print(f"  Active Cells ({len(remaining_ids)}): {remaining_ids[:10]}...")
+                    
+                    if remaining_ids:
+                        rem_geom = self.road_cells[self.road_cells['id'].isin(remaining_ids)]
+                        if not rem_geom.empty:
+                            print(f"  -> Plotting {len(rem_geom)} agent clusters (centroids) in Magenta.")
+                            
+                            # Use Centroids for clear "Point" visualization
+                            # Avoid covering the whole road line
+                            centroids = rem_geom.geometry.centroid
+                            
+                            # Plot Stars
+                            centroids.plot(ax=ax, color='#ff00ff', marker='*', markersize=150, zorder=8, edgecolor='black', linewidth=1)
+                            self.remaining_artist = ax.collections[-1] # valid reference
+
+            elif self.view_mode == 'casualties':
                 # Casualty Mode (Dynamic Map of deaths up to this frame)
+                # Cleanup special artists if switching logic
+                if self.quiver: 
+                    self.quiver.remove()
+                    self.quiver = None
+                if self.remaining_artist:
+                    try:
+                        self.remaining_artist.remove()
+                    except: pass
+                    self.remaining_artist = None
+
                 if frame < len(self.per_cell_casualty_history):
                     current_deaths = self.per_cell_casualty_history[frame]
                 else:
@@ -965,23 +1147,38 @@ class MCASimulation:
                 deaths = [current_deaths.get(idx, 0) for idx in self.road_cells['id']]
                 collection.set_array(np.array(deaths))
                 collection.set_cmap('Reds')
-                # USER REQUEST: Any death = RED
-                # Clamp at 1.0. So 1 death = 1.0 (Max Red).
                 collection.set_clim(0, 1) 
-                
-                # Hide Quiver
+            
+            elif self.view_mode == 'penalties':
+                # Penalty Mode (Hazard Intensity)
                 if self.quiver: 
                     self.quiver.remove()
                     self.quiver = None
+                if self.remaining_artist:
+                    try: self.remaining_artist.remove()
+                    except: pass
+                    self.remaining_artist = None
+
+                p_data = self.penalty_history[frame]
+                scores = [p_data.get(idx, 0) for idx in self.road_cells['id']]
+                collection.set_array(np.array(scores))
+                collection.set_cmap('YlOrRd')
+                collection.set_clim(0, 1.0) 
 
             # 3. Counters
             current_agents = sum(pop_data.values())
             evacuated_count = self.total_agents_init - int(current_agents) - int(casualties)
+            
+            status_line = ""
+            if frame == len(self.history) - 1 and current_agents > 0:
+                status_line = f"\n⚠️ FINAL: {int(current_agents)} Agents Stranded (Magenta)"
+
             info_text.set_text(
                 f"⏱️ Time: {frame}s\n"
                 f"👥 Alive: {int(current_agents)}\n"
                 f"💀 Casualties: {int(casualties)}\n"
                 f"✅ Evacuated: {evacuated_count}"
+                f"{status_line}"
             )
             
             # 4. Selection
@@ -1014,16 +1211,23 @@ class MCASimulation:
         def toggle_view(event):
             if self.view_mode == 'occupancy':
                 self.view_mode = 'casualties'
-                self.btn_casualty.label.set_text('Show Live Flow')
-                self.btn_casualty.color = 'lightblue'
-                self.btn_casualty.hovercolor = 'blue'
+                self.btn_casualty.label.set_text('Show Penalties')
+                self.btn_casualty.color = 'salmon'
+                self.btn_casualty.hovercolor = 'red'
                 ax.set_title("Total Casualties Heatmap (Any Red = >0 Deaths)", fontsize=14, fontweight='bold')
                 cbar.set_label('Total Casualties (Threshold = 1)')
+            elif self.view_mode == 'casualties':
+                self.view_mode = 'penalties'
+                self.btn_casualty.label.set_text('Show Live Flow')
+                self.btn_casualty.color = 'gold'
+                self.btn_casualty.hovercolor = 'orange'
+                ax.set_title("Hazard Penalty Map (Smoke/Fire Intensity)", fontsize=14, fontweight='bold')
+                cbar.set_label('Hazard Level (Composite Score 0.0 - 1.0)')
             else:
                 self.view_mode = 'occupancy'
                 self.btn_casualty.label.set_text('Show Casualties')
-                self.btn_casualty.color = 'salmon'
-                self.btn_casualty.hovercolor = 'red'
+                self.btn_casualty.color = 'lightblue'
+                self.btn_casualty.hovercolor = 'blue'
                 ax.set_title("USTP Evacuation (Per-Cell Capacity Analysis)", fontsize=14, fontweight='bold')
                 cbar.set_label('Occupancy Ratio (Population / Capacity)')
             
@@ -1152,232 +1356,118 @@ class MCASimulation:
         fig.canvas.mpl_connect('motion_notify_event', on_motion)
         fig.canvas.mpl_connect('scroll_event', on_scroll)
         
-def get_config_from_terminal():
-    print("\n=== MCA Simulation (Iterative Batch Run) ===")
+        self.anim = FuncAnimation(fig, update, frames=len(self.history), interval=100, blit=False, repeat=False)
+        plt.show()
+
+        plt.show()
+
+def show_launcher():
+    """
+    Shows a styled configuration window before the simulation starts.
+    Returns a dict with config values.
+    """
+    root = tk.Tk()
+    root.title("MCA Simulation Launcher")
     
-    # Defaults
-    d_agents = 5000
-    d_steps = 300
-    d_iters = 5
+    # improved styling
+    bg_color = "#f0f0f0"
+    root.configure(bg=bg_color)
     
-    # Try parsing CLI args first
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--iters', type=int)
-    parser.add_argument('--agents', type=int)
-    parser.add_argument('--steps', type=int)
-    parser.add_argument('--block', type=int, nargs='*')
-    args, unknown = parser.parse_known_args()
+    # Calculate center position
+    window_width = 450
+    window_height = 350
+    screen_width = root.winfo_screenwidth()
+    screen_height = root.winfo_screenheight()
+    x_c = int((screen_width/2) - (window_width/2))
+    y_c = int((screen_height/2) - (window_height/2))
+    root.geometry(f"{window_width}x{window_height}+{x_c}+{y_c}")
     
-    if args.iters or args.agents:
-        # If CLI args are present, use them and skip interactive input
-        return {
-            'agents': args.agents if args.agents else d_agents,
-            'steps': args.steps if args.steps else d_steps,
-            'iterations': args.iters if args.iters else d_iters,
-            'block': args.block if args.block else []
-        }
+    config = {'block': [], 'agents': 5000, 'steps': 300}
     
-    try:
-        a_str = input(f"Total Agents [{d_agents}]: ").strip()
-        agents = int(a_str) if a_str else d_agents
-        
-        s_str = input(f"Duration (Steps) [{d_steps}]: ").strip()
-        steps = int(s_str) if s_str else d_steps
-        
-        i_str = input(f"Iterations [{d_iters}]: ").strip()
-        iterations = int(i_str) if i_str else d_iters
-        
-        b_str = input("Blocked Cells (IDs, space separated) []: ").strip()
-        block = [int(x) for x in b_str.split()] if b_str else []
-        
-        return {'agents': agents, 'steps': steps, 'iterations': iterations, 'block': block}
-        
-    except ValueError:
-        print("Invalid input. Using defaults.")
-        return {'agents': d_agents, 'steps': d_steps, 'iterations': d_iters, 'block': []}
+    # Header
+    lbl_header = tk.Label(root, text="Simulation Configuration", font=("Segoe UI", 16, "bold"), bg=bg_color)
+    lbl_header.pack(pady=15)
+    
+    frame_form = tk.Frame(root, bg=bg_color)
+    frame_form.pack(pady=10, padx=20, fill="x")
+    
+    # 1. Agent Count
+    tk.Label(frame_form, text="Total Agents:", font=("Segoe UI", 10), bg=bg_color, anchor="w").grid(row=0, column=0, sticky="w", pady=5)
+    ent_agents = tk.Entry(frame_form, font=("Segoe UI", 10))
+    ent_agents.insert(0, "5000")
+    ent_agents.grid(row=0, column=1, sticky="e", padx=5)
+
+    # 2. Duration
+    tk.Label(frame_form, text="Duration (Steps/Secs):", font=("Segoe UI", 10), bg=bg_color, anchor="w").grid(row=1, column=0, sticky="w", pady=5)
+    ent_steps = tk.Entry(frame_form, font=("Segoe UI", 10))
+    ent_steps.insert(0, "500")
+    ent_steps.grid(row=1, column=1, sticky="e", padx=5)
+
+    # 3. Blocked Cells
+    tk.Label(frame_form, text="Blocked Cells (IDs):", font=("Segoe UI", 10), bg=bg_color, anchor="w").grid(row=2, column=0, sticky="w", pady=5)
+    ent_block = tk.Entry(frame_form, font=("Segoe UI", 10))
+    ent_block.grid(row=2, column=1, sticky="e", padx=5)
+    
+    tk.Label(frame_form, text="(Space separated, e.g. '88 78')", font=("Segoe UI", 8, "italic"), bg=bg_color, fg="gray").grid(row=3, column=1, sticky="e")
+
+    def on_start():
+        try:
+            config['agents'] = int(ent_agents.get())
+            config['steps'] = int(ent_steps.get())
+            block_str = ent_block.get().strip()
+            if block_str:
+                config['block'] = [int(x) for x in block_str.split()]
+            root.destroy()
+        except ValueError:
+            messagebox.showerror("Error", "Invalid numeric input!")
+    
+    btn_start = tk.Button(root, text="START SIMULATION", command=on_start, 
+                          bg="#4CAF50", fg="white", font=("Segoe UI", 12, "bold"), 
+                          relief="flat", padx=20, pady=5, cursor="hand2")
+    btn_start.pack(pady=25)
+    
+    root.mainloop()
+    return config
 
 def main():
-    config = get_config_from_terminal()
-    print(f"\nStarting Batch Run with config: {config}")
+    import sys
+    
+    # Check for CLI flag to bypass GUI
+    cli_mode = '--cli' in sys.argv
+    
+    if cli_mode:
+        print("CLI Mode detected. Bypassing GUI Launcher...")
+        config = {'block': [], 'agents': 5000, 'steps': 500}
+    else:
+        # Use Launcher if no CLI args provided
+        config = show_launcher()
+    
+    print(f"Starting with config: {config}")
 
-    sim_iterations = config['iterations']
-    
-    # Store per-run summaries
-    run_summaries = []
-    
-    # Store bulky data for "Average Curve" calculation
-    all_time_metrics = []
-    all_spatial_metrics = []
-    all_exit_metrics = []
-    
     # DATA PATH
     import os
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    gpkg_path = os.path.join(base_dir, "..", "GPKG_Files", themap) # Using 'themap' here
+    gpkg_path = os.path.join(base_dir, "..", "GPKG_Files", themap)
 
-    for i in range(sim_iterations):
-        print(f"\n{'='*20}\nRUN {i+1}/{sim_iterations}\n{'='*20}")
-        
-        sim = MCASimulation(gpkg_path)
-        sim.load_data()
-        sim.build_graph()
+    sim = MCASimulation(gpkg_path)
+    sim.load_data()
+    sim.build_graph()
+    
+    # Apply Scenarios
+    if config['block']:
         sim.apply_scenario_blockages(config['block'])
-        sim.compute_flow_directions()
-        sim.initialize_population(total_agents=config['agents'])
         
-        # Run Headless
-        sim.run(steps=config['steps'])
-        
-        # Capture Data
-        df_t, df_s, df_e, df_sum = sim.generate_results_dataframes()
-        
-        # 1. Compute Scalar Metrics for this Run
-        # Means over time (excluding time=0 if needed, but mean including 0 is fine for "session average")
-        mean_flow = df_t['Exit Flow Rate'].mean()
-        mean_density = df_t['Density Evolution'].mean()
-        mean_velocity = df_t['Velocity of Evacuees'].mean()
-        peak_density = df_t['Peak Density'].max()
-        
-        # End-of-Run Status
-        remaining_agents = df_t['Remaining Evacuees'].iloc[-1]
-        total_evacuated = df_e['Exit Usage Distribution'].sum()
-        
-        total_time = df_sum['Total Evacuation Time'].iloc[0]
-        total_casualties = df_sum['Total Casualties'].iloc[0]
-        
-        # Append to summary list
-        run_summaries.append({
-            'Run': i + 1,
-            'Avg Exit Flow Rate': float(f"{mean_flow:.2f}"),
-            'Avg Density (p/m2)': float(f"{mean_density:.2f}"),
-            'Avg Velocity (m/s)': float(f"{mean_velocity:.2f}"),
-            'Peak Density (p/m2)': float(f"{peak_density:.2f}"),
-            'Total Casualties': int(total_casualties),
-            'Total Evacuated': int(total_evacuated),
-            'Remaining Agents': int(remaining_agents),
-            'Total Evacuation Time (s)': float(total_time)
-        })
-        
-        # Store for global averaging of the curves
-        df_t['Run'] = i + 1
-        all_time_metrics.append(df_t)
-        
-        # Store for global averaging of Spatial/Exit
-        all_spatial_metrics.append(df_s)
-        all_exit_metrics.append(df_e)
-        
-        
-    print(f"\n{'='*40}")
-    print("COMPUTING AGGREGATE STATS...")
-    print(f"{'='*40}")
-
-    # 1. Run Comparison Table
-    df_runs = pd.DataFrame(run_summaries)
+    sim.compute_flow_directions()
     
-    # Calculate Average of Runs
-    avg_row = df_runs.mean(numeric_only=True)
-    avg_row['Run'] = 'AVERAGE' 
-    # Cast integers for logic
-    avg_row['Total Casualties'] = avg_row['Total Casualties']
-    avg_row['Total Evacuated'] = int(avg_row['Total Evacuated'])
-    avg_row['Remaining Agents'] = avg_row['Remaining Agents']
+    # Forensic Analysis
+    if not config['block']:
+        sim.analyze_specific_cell(88) 
     
-    # Append Average Row safely
-    df_runs_final = pd.concat([df_runs, pd.DataFrame([avg_row])], ignore_index=True)
-
-    # USER REQUEST: Add column titles below the average row for readability
-    header_row = {col: col for col in df_runs.columns}
-    df_runs_final = pd.concat([df_runs_final, pd.DataFrame([header_row])], ignore_index=True)
+    sim.initialize_population(total_agents=config['agents'])
+    sim.run(steps=config['steps'])
     
-    # 2. Average Time Curve (Optional but requested "average for each metric")
-    # This gives the "Average Flow vs Time" graph data
-    full_time = pd.concat(all_time_metrics)
-    avg_time_curve = full_time.groupby('Time (s)').mean(numeric_only=True).reset_index()
-    avg_time_curve['Run'] = 'AVERAGE_CURVE'
-    
-    # 3. Average Spatial Distribution
-    full_spatial = pd.concat(all_spatial_metrics)
-    # Group by Cell ID and Average the numeric columns
-    avg_spatial = full_spatial.groupby('Cell ID').mean(numeric_only=True).reset_index()
-    avg_spatial = avg_spatial.sort_values(by='Spatial Distribution (Casualties)', ascending=False)
-    
-    # 4. Average Exit Usage
-    full_exits = pd.concat(all_exit_metrics)
-    avg_exits = full_exits.groupby('Exit ID').mean(numeric_only=True).reset_index()
-    
-    # SAVE
-    # User Request: Save to same folder as script
-    import os
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    filename = os.path.join(script_dir, "simulation_results_base_2.xlsx")
-    try:
-        # STYLING
-        def color_columns(s):
-            # s is a Series (column)
-            # Define colors
-            c_gray = 'background-color: #e0e0e0'
-            c_red = 'background-color: #ffcccb'
-            c_green = 'background-color: #d0f0c0'
-            c_blue = 'background-color: #add8e6'
-            c_yellow = 'background-color: #ffffe0'
-            
-            if s.name == 'Run':
-                return [c_gray] * len(s)
-            elif 'Casualties' in s.name or 'Remaining' in s.name:
-                return [c_red] * len(s)
-            elif 'Evacuated' in s.name or 'Flow' in s.name:
-                return [c_green] * len(s) # Positive flow/evac
-            elif 'Density' in s.name or 'Velocity' in s.name:
-                return [c_blue] * len(s) # Physics
-            elif 'Time' in s.name:
-                return [c_yellow] * len(s)
-            return [''] * len(s)
-
-        # Apply style
-        try:
-            styled_df = df_runs_final.style.apply(color_columns, axis=0)
-            
-            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
-                # Sheet 1: The Iteration Table (User's primary request) - STYLED
-                styled_df.to_excel(writer, sheet_name='Run Comparisons', index=False)
-                # Sheet 2: The Average Curve
-                avg_time_curve.to_excel(writer, sheet_name='Avg Time Series', index=False)
-                # Sheet 3: Avg Spatial
-                avg_spatial.to_excel(writer, sheet_name='Avg Spatial Dist', index=False)
-                # Sheet 4: Avg Exit Usage
-                avg_exits.to_excel(writer, sheet_name='Avg Exit Usage', index=False)
-                
-            print(f"✅ AVERAGED Results saved to {filename}")
-            print("Report contains 'Run Comparisons' (Colored Columns) and 'Avg Time Series'.")
-            
-        except ImportError as e:
-            # Fallback if jinja2 missing
-            print(f"⚠️ Styling failed (missing dependency): {e}. Saving unstyled version...")
-            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
-                df_runs_final.to_excel(writer, sheet_name='Run Comparisons', index=False)
-                avg_time_curve.to_excel(writer, sheet_name='Avg Time Series', index=False)
-            print(f"✅ AVERAGED Results saved to {filename} (Unstyled)")
-
-        except Exception as e:
-            print(f"⚠️ Styling/Saving failed: {e}. Attempting unstyled save...")
-            # Emergency Fallback
-            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
-                df_runs_final.to_excel(writer, sheet_name='Run Comparisons', index=False)
-                avg_time_curve.to_excel(writer, sheet_name='Avg Time Series', index=False)
-            print(f"✅ AVERAGED Results saved to {filename} (Unstyled)")
-
-    except Exception as e:
-        print(f"❌ Failed to save Excel: {e}")
-        # Even the fallback failed or something else is wrong
-        # Try to dump CSV at least?
-        try:
-            df_runs_final.to_csv("simulation_results_backup.csv", index=False)
-            print("⚠️ Saved backup to simulation_results_backup.csv")
-        except:
-            pass
-
-    print("Batch Run Complete. (Pure Headless Mode)")
+    if not cli_mode:
+        sim.animate_results()
 
 if __name__ == "__main__":
     main()

@@ -651,6 +651,172 @@ class MCASimulation:
                     best_neighbor = neighbor
             
             self.directions[node] = best_neighbor
+
+        # Identify cells unreachable from any exit
+        self.unreachable_cells = set()
+        for node in self.graph.nodes:
+            if node not in exit_indices and self.directions.get(node) is None:
+                d_safe = self.dijkstra_distances.get(node, float('inf'))
+                d_exit = self.dist_to_exit.get(node, float('inf'))
+                if d_safe == float('inf') and d_exit == float('inf'):
+                    self.unreachable_cells.add(node)
+
+        if self.unreachable_cells:
+            print(f"  - WARNING: {len(self.unreachable_cells)} cells are UNREACHABLE from any exit: {sorted(self.unreachable_cells)}")
+            print(f"    Agents will NOT be spawned on these cells.")
+        
+        # ---------------------------------------------------------
+        # 3. CONNECTIVITY REPAIR (Safeguard for Dijkstra)
+        # ---------------------------------------------------------
+        # Even with Dijkstra, small disconnected islands might exist.
+        # This BFS repair ensures ALL agents have a valid path to the main network.
+
+        print("  - Validating flow connectivity...")
+        
+        # A. Identify Independent Valid Set
+        valid_flow_nodes = set(exit_indices)
+        
+        # Reverse flow mapping
+        reverse_flow = {u: [] for u in self.graph.nodes}
+        for u, v in self.directions.items():
+            if v is not None:
+                if v not in reverse_flow: reverse_flow[v] = []
+                reverse_flow[v].append(u)
+        
+        # BFS from exits backwards
+        visited = set(exit_indices)
+        import collections
+        q = collections.deque(exit_indices)
+        
+        while q:
+            curr = q.popleft()
+            sources = reverse_flow.get(curr, [])
+            for src in sources:
+                if src not in visited:
+                    visited.add(src)
+                    q.append(src)
+        
+        valid_flow_nodes = visited
+        stuck_nodes = [n for n in self.graph.nodes if n not in valid_flow_nodes and n not in exit_indices]
+        
+        if stuck_nodes:
+            print(f"  - DETECTED {len(stuck_nodes)} STRANDED CELLS. Repairing...")
+            
+            # B. Repair Plan: BFS from Valid Set
+            q_repair = collections.deque(valid_flow_nodes)
+            dist_to_valid = {n: 0 for n in valid_flow_nodes}
+            
+            while q_repair:
+                curr = q_repair.popleft()
+                current_dist = dist_to_valid[curr]
+                
+                for nbr in self.graph.neighbors(curr):
+                    if nbr not in dist_to_valid:
+                        dist_to_valid[nbr] = current_dist + 1
+                        q_repair.append(nbr)
+            
+            # C. Re-assign directions
+            fixed_count = 0
+            for nid in stuck_nodes:
+                best_fix = None
+                best_fix_dist = float('inf')
+                
+                neighbors = list(self.graph.neighbors(nid))
+                # Hybrid distance tie-breaker
+                neighbors.sort(key=lambda x: self.dijkstra_distances.get(x, float('inf')))
+                
+                for nbr in neighbors:
+                    d = dist_to_valid.get(nbr, float('inf'))
+                    if d < best_fix_dist:
+                        best_fix_dist = d
+                        best_fix = nbr
+                
+                if best_fix is not None:
+                    self.directions[nid] = best_fix
+                    fixed_count += 1
+                else:
+                    self.directions[nid] = None
+            
+            print(f"  - REPAIRED {fixed_count} cells. Agents will now flow to validity.")
+        else:
+            print("  - Flow check passed. All cells have valid paths.")
+
+        
+        # ---------------------------------------------------------
+        # 3. CONNECTIVITY REPAIR (Safeguard for Dijkstra)
+        # ---------------------------------------------------------
+        # Even with Dijkstra, small disconnected islands might exist.
+        # This BFS repair ensures ALL agents have a valid path to the main network.
+
+        print("  - Validating flow connectivity...")
+        
+        # A. Identify Independent Valid Set
+        valid_flow_nodes = set(exit_indices)
+        
+        # Reverse flow mapping
+        reverse_flow = {u: [] for u in self.graph.nodes}
+        for u, v in self.directions.items():
+            if v is not None:
+                if v not in reverse_flow: reverse_flow[v] = []
+                reverse_flow[v].append(u)
+        
+        # BFS from exits backwards
+        visited = set(exit_indices)
+        import collections
+        q = collections.deque(exit_indices)
+        
+        while q:
+            curr = q.popleft()
+            sources = reverse_flow.get(curr, [])
+            for src in sources:
+                if src not in visited:
+                    visited.add(src)
+                    q.append(src)
+        
+        valid_flow_nodes = visited
+        stuck_nodes = [n for n in self.graph.nodes if n not in valid_flow_nodes and n not in exit_indices]
+        
+        if stuck_nodes:
+            print(f"  - DETECTED {len(stuck_nodes)} STRANDED CELLS. Repairing...")
+            
+            # B. Repair Plan: BFS from Valid Set
+            q_repair = collections.deque(valid_flow_nodes)
+            dist_to_valid = {n: 0 for n in valid_flow_nodes}
+            
+            while q_repair:
+                curr = q_repair.popleft()
+                current_dist = dist_to_valid[curr]
+                
+                for nbr in self.graph.neighbors(curr):
+                    if nbr not in dist_to_valid:
+                        dist_to_valid[nbr] = current_dist + 1
+                        q_repair.append(nbr)
+            
+            # C. Re-assign directions
+            fixed_count = 0
+            for nid in stuck_nodes:
+                best_fix = None
+                best_fix_dist = float('inf')
+                
+                neighbors = list(self.graph.neighbors(nid))
+                # Hybrid distance tie-breaker
+                neighbors.sort(key=lambda x: self.dijkstra_distances.get(x, float('inf')))
+                
+                for nbr in neighbors:
+                    d = dist_to_valid.get(nbr, float('inf'))
+                    if d < best_fix_dist:
+                        best_fix_dist = d
+                        best_fix = nbr
+                
+                if best_fix is not None:
+                    self.directions[nid] = best_fix
+                    fixed_count += 1
+                else:
+                    self.directions[nid] = None
+            
+            print(f"  - REPAIRED {fixed_count} cells. Agents will now flow to validity.")
+        else:
+            print("  - Flow check passed. All cells have valid paths.")
         
         # ------------------------------------------------------------------------
         # OVERRIDE: BRIDGE SAFE ZONES TO EXITS
@@ -704,7 +870,11 @@ class MCASimulation:
             spawn_buffer = self.spawns.buffer(5.0)
             for idx, cell in self.road_cells.iterrows():
                 if spawn_buffer.intersects(cell.geometry).any():
-                    source_ids.append(cell['id'])
+                    cid = cell['id']
+                    # Skip cells unreachable from exits
+                    if hasattr(self, 'unreachable_cells') and cid in self.unreachable_cells:
+                        continue
+                    source_ids.append(cid)
             
             if source_ids:
                 # Randomize distribution
@@ -737,6 +907,8 @@ class MCASimulation:
         
         self.per_cell_casualty_history = []
         self.per_cell_casualty_history.append(self.casualties_per_cell.copy())
+        
+        self.garbage = 0.0 # Track removed ghost agents
 
 
     def calculate_composite_score(self, cid, rho, fire_val):
@@ -777,9 +949,9 @@ class MCASimulation:
         Fire/Terrain do NOT decay here (managed by event/static).
         """
         # Decay Rates
-        DECAY_SMOKE = 0.03  # Faster Decay (was 0.01)
-        DECAY_DEBRIS = 0.01 # Faster Decay (was 0.005)
-        DECAY_TEMP = 0.1
+        DECAY_SMOKE = 0.1  # Faster Decay (was 0.03)
+        DECAY_DEBRIS = 0.1 # Faster Decay (was 0.01)
+        DECAY_TEMP = 0.2
         
         for cid, p_dict in self.penalties.items():
             # Decay
@@ -795,8 +967,8 @@ class MCASimulation:
             if p_dict['fire'] > 0:
                 if cid in self.burnt_cells:
                     # DECAY PHASE
-                    # User Request: "Decay is WAY too slow" -> Increased to 0.03
-                    p_dict['fire'] = max(0.0, p_dict['fire'] - 0.03)
+                    # User Request: "Decay is WAY too slow" -> Increased to 0.1
+                    p_dict['fire'] = max(0.0, p_dict['fire'] - 0.1)
                     if p_dict['fire'] == 0:
                         self.burnt_cells.remove(cid)
                 else:
@@ -949,6 +1121,7 @@ class MCASimulation:
             # (We already found current_max_penalty, but let's finding the ID)
             hazard_center = None
             max_p = -1
+            updates = {} # CRITICAL FIX: Initialize updates to prevent crash
             for cid in new_population:
                 if count > 0: # Check only occupied? Or all? 
                     # We need the source of the penalty, which might be empty now but was high.
@@ -1009,6 +1182,8 @@ class MCASimulation:
                     self.dijkstra_distances, _ = Dijkstra.calculate_dijkstra_field(
                         self.graph, self.safe_zone_cells, initial_costs=initial_costs
                     )
+                    # Global Recompute affects everyone
+                    updates = {n: self.dijkstra_distances.get(n, float('inf')) for n in self.graph.nodes}
             
             # Re-derive directions (PARTIAL UPDATE OPTIMIZATION)
             # Update directions for all nodes that were patched + their neighbors
@@ -1051,16 +1226,28 @@ class MCASimulation:
                 candidates = [n for n in self.graph.neighbors(node) 
                               if abs(source_field.get(n, float('inf')) - best_d_found) < 1e-5]
                 
-                # 3. Select Best
-                if candidates:
-                    # Stickiness: If current target is in the top tier, keep it.
-                    if current_target in candidates:
-                        best_neighbor = current_target
-                    else:
-                        # Tie-breaker: Pick one (First / deterministic)
-                        best_neighbor = candidates[0]
-                else:
-                    best_neighbor = None
+                # 3. Select Best with HYSTERESIS (Stickiness)
+                # Prevent oscillation by keeping current target if it's "good enough" (within 5% of best)
+                
+                best_neighbor = None
+                
+                # Check current target first
+                kept_current = False
+                if current_target is not None:
+                     # Check if it's still a valid neighbor
+                     if self.graph.has_edge(node, current_target):
+                          current_dist = source_field.get(current_target, float('inf'))
+                          # Hysteresis Factor: 1.50 (50% tolerance) - MAX STICKINESS
+                          if current_dist <= best_d_found * 1.50:
+                               best_neighbor = current_target
+                               kept_current = True
+                
+                # If we didn't keep current, pick the absolute best
+                if not kept_current:
+                     if candidates:
+                          best_neighbor = candidates[0] # Candidates are already those with min_dist
+                     else:
+                          best_neighbor = None
                 
                 self.directions[node] = best_neighbor
 
@@ -1077,6 +1264,8 @@ class MCASimulation:
         for cid in self.graph.nodes:
             current_pop = new_population[cid]
             if current_pop <= 0: continue
+            
+            # DEBUG STUCK AGENTS REMOVED
                 
             target_id = self.directions.get(cid)
             if target_id is None:
@@ -1095,6 +1284,11 @@ class MCASimulation:
                          
                          new_population[cid] = max(0, new_population[cid] - actual_out)
                          step_exit_flow[exit_id] = step_exit_flow.get(exit_id, 0) + actual_out
+                         
+                         # NEW: Record Flow for Visualization
+                         if actual_out > 0.05:
+                             # Use a special target key for exit
+                             current_step_flows[(cid, 'EXIT')] = current_step_flows.get((cid, 'EXIT'), 0) + actual_out
                      else:
                          # LOCAL MINIMUM -> Stuck
                          # Agents remain here. do nothing.
@@ -1141,18 +1335,30 @@ class MCASimulation:
             actual_flow = max(0, actual_flow)
             actual_flow = min(actual_flow, current_pop)
             
+            if cid in [247, 248] and current_pop > 0.5:
+                 pass # Debug Removed
+
             new_population[cid] -= actual_flow
             new_population[target_id] += actual_flow
             
             # Log Flow
-            if actual_flow > 0:
+            if actual_flow > 0.05:
                 current_step_flows[(cid, target_id)] = current_step_flows.get((cid, target_id), 0) + actual_flow
+                # if self.time_step % 50 == 0: print(f"DEBUG: Recorded Flow {cid}->{target_id}: {actual_flow}") # VERBOSE DEBUG
 
         # Commit buffered exit flow
         for eid, count in step_exit_flow.items():
             self.exit_usage[eid] += count
 
         self.population = new_population
+        
+        # Population Hygiene (Remove Ghosts)
+        for cid in list(self.population.keys()):
+            if self.population[cid] < 0.05:
+                removed_amount = self.population[cid]
+                self.garbage += removed_amount
+                self.population[cid] = 0.0
+
         self.flow_history.append(current_step_flows)
         self.time_step += 1
         return sum(self.population.values())
@@ -1414,6 +1620,9 @@ class MCASimulation:
         print(f"  Remaining:     {total_remaining:.0f}")
         print(f"  Evacuated:     {total_evacuated:.0f}")
         print(f"  Dead:          {total_dead:.0f}")
+        print(f"  Ghost Cleaned: {self.garbage:.2f}")
+        
+        final_total = total_remaining + total_evacuated + total_dead + self.garbage
         print(f"  Calculated Sum:{final_total:.0f}")
         print(f"  DISCREPANCY:   {self.total_agents_init - final_total:.2f}")
         
@@ -1502,8 +1711,16 @@ class MCASimulation:
         self.current_frame = 0
         self.view_mode = 'occupancy' 
         self.remaining_artist = None
+        
+        # Optimize Exit Lookup (Cache Centroids)
+        self.exit_centroids_cache = {}
+        if self.exits is not None:
+             if isinstance(self.exits, gpd.GeoDataFrame):
+                  for idx, row in self.exits.iterrows():
+                      self.exit_centroids_cache[idx] = row.geometry.centroid
 
         # Pre-Compute Flow Vectors for Arrow Visualization
+
         self.flow_vectors = {}
         if hasattr(self, 'directions'):
             import math
@@ -1519,7 +1736,7 @@ class MCASimulation:
         
         # Visualization for Casualties (Markers)
         # We use a scatter plot to show 'X' marks where deaths occur
-        self.scat_casualties = ax.scatter([], [], marker='x', s=100, color='red', linewidth=2.0, zorder=30) 
+        self.scat_casualties = ax.scatter([], [], marker='s', s=120, color='red', alpha=0.6, zorder=30, label='Casualties') 
         # NEW: Scatter for Penalties (Orange Squares)
         self.scat_penalties = ax.scatter([], [], marker='s', s=120, color='orange', alpha=0.6, zorder=35, label='Hazards') 
 
@@ -1647,8 +1864,11 @@ class MCASimulation:
                     f"(Historical Accumulation)"
                 )
 
-        def update(frame):
+        def _update_unsafe(frame):
             self.current_frame = frame
+            # print(f"DEBUG: Animating Frame {frame}") # Reduce spam if user runs again
+            
+            # --- PHASE 1: DIJKSTRA FLOODFILL ---
             
             # --- PHASE 1: DIJKSTRA FLOODFILL ---
             # If we are in the intro phase, visualize the floodfill process
@@ -1662,9 +1882,10 @@ class MCASimulation:
                  # Hide Phase 2 Artifacts
                  self.scat_casualties.set_visible(False)
                  self.scat_penalties.set_visible(False)
+                 self.scat_casualties.set_visible(False)
+                 self.scat_penalties.set_visible(False)
                  if self.quiver: 
-                     self.quiver.remove()
-                     self.quiver = None
+                     self.quiver.set_visible(False)
                  
                  # Color Map for Floodfill
                  # 1. PRE-COMPUTED COLORS (Phase A - Multi-Source Field)
@@ -1731,7 +1952,9 @@ class MCASimulation:
                  self.scat_penalties.set_visible(False)
 
                  # RESET Facecolors (Critical fix for toggle persistence)
-                 collection.set_facecolors([]) # Empty list resets to use cmap array
+                 # collection.set_facecolors([])
+                 # NOTE: sending None allows set_array to work.
+                 collection.set_facecolors(None) 
                  collection.set_edgecolors('lightgray')
 
                  collection.set_cmap('turbo')
@@ -1745,43 +1968,51 @@ class MCASimulation:
                  collection.set_array(np.array(ratios))
                  collection.set_clim(0, 1.0)
                  
-                 # Dynamic Flow Arrows (Only where agents are)
+                 # Dynamic Flow Arrows (Historical Truth)
                  if self.quiver: self.quiver.remove()
                  xq, yq, uq, vq = [], [], [], []
                  
-                 # Get Dynamic Field for this frame
-                 d_map = self.dijkstra_distances # Default
-                 if hasattr(self, 'distance_history') and sim_frame < len(self.distance_history):
-                     d_map = self.distance_history[sim_frame]
+                 # Get Flows for this frame (Movement that happened FROM this state)
+                 if hasattr(self, 'flow_history') and sim_frame < len(self.flow_history):
+                     flows = self.flow_history[sim_frame]
+                     # DEBUG: Check if we have flows!
+                     if sim_frame > 0 and len(flows) == 0:
+                          if sim_frame % 50 == 0: print(f"DEBUG Frame {sim_frame}: NO FLOWS RECORDED!")
+                     elif sim_frame % 50 == 0:
+                          print(f"DEBUG Frame {sim_frame}: {len(flows)} active flows. Samples: {list(flows.keys())[:3]}")
+                     
+                     for (u, v), count in flows.items():
+                         if count > 0.0:
+                             start_pt = self.cell_centroids.get(u)
+                             end_pt = None
+                             
+                             if v == 'EXIT':
+                                  # Find which exit it is connected to
+                                 eid = self.road_to_exit.get(u)
+                                 # We need the geometry of the Exit or just point out
+                                 if eid is not None:
+                                      # Use Cached Exit Centroid
+                                      end_pt = self.exit_centroids_cache.get(eid)
+                                      
+                                      # Fallback: if not in cache (maybe index mismatch), verify
+                                      if end_pt is None:
+                                           # Try finding a near exit if strict ID failed? unneeded overhead.
+                                           pass
+                             else:
+                                 end_pt = self.cell_centroids.get(v)
+                             
+                             if start_pt and end_pt:
+                                 dx = end_pt.x - start_pt.x
+                                 dy = end_pt.y - start_pt.y
+                                 norm = np.hypot(dx, dy)
+                                 if norm > 0:
+                                     xq.append(start_pt.x)
+                                     yq.append(start_pt.y)
+                                     uq.append(dx/norm)
+                                     vq.append(dy/norm)
                  
-                 for idx, count in pop_data.items():
-                     if count > 1.0:
-                          centroid = self.cell_centroids.get(idx)
-                          # FIX: Derive Dynamic Vector from d_map
-                          # Find steepest descent neighbor in this frame's field
-                          best_n = None
-                          min_d = d_map.get(idx, float('inf'))
-                          
-                          # Gradient Search
-                          for n in self.graph.neighbors(idx):
-                              dn = d_map.get(n, float('inf'))
-                              if dn < min_d:
-                                  min_d = dn
-                                  best_n = n
-                                  
-                          if best_n:
-                              target_pt = self.cell_centroids[best_n]
-                              dx = target_pt.x - centroid.x
-                              dy = target_pt.y - centroid.y
-                              norm = np.hypot(dx, dy)
-                              if norm > 0:
-                                  xq.append(centroid.x)
-                                  yq.append(centroid.y)
-                                  uq.append(dx/norm)
-                                  vq.append(dy/norm)
-                               
                  if xq:
-                     self.quiver = ax.quiver(xq, yq, uq, vq, scale=30, width=0.003, color='black', alpha=0.6, zorder=6)
+                     self.quiver = ax.quiver(xq, yq, uq, vq, scale=30, width=0.003, color='black', alpha=0.8, zorder=20)
                  else:
                      self.quiver = None
  
@@ -1920,6 +2151,11 @@ class MCASimulation:
             status_line = ""
             if frame == len(self.history) - 1 and current_agents > 0:
                 status_line = f"\n⚠️ FINAL: {int(current_agents)} Agents Stranded (Magenta)"
+            
+            # Casualties THIS STEP (Feedback for disappearing agents)
+            cas_now = 0
+            if sim_frame > 0 and sim_frame < len(self.casualty_history):
+                cas_now = self.casualty_history[sim_frame] - self.casualty_history[sim_frame-1]
 
             info_text.set_text(
                 f"⏱️ Time: {sim_frame}s\n"
@@ -1929,8 +2165,24 @@ class MCASimulation:
                 f"{status_line}"
             )
             
+            if cas_now > 0:
+                 info_text.set_text(info_text.get_text() + f"\n⚠️ DYING: +{int(cas_now)}/s")
+                 info_text.set_bbox(dict(facecolor='#ffcccc', alpha=0.9, boxstyle='round,pad=0.5')) # Red Alert
+            else:
+                 info_text.set_bbox(dict(facecolor='white', alpha=0.9, boxstyle='round,pad=0.5'))
+            
             update_selection_text(frame)
             return collection, info_text, selected_cell_text
+
+        def update(frame):
+            try:
+                return _update_unsafe(frame)
+            except Exception as e:
+                print(f"!!! ANIMATION ERROR at Frame {frame}: {e}")
+                import traceback
+                traceback.print_exc()
+                # Return dummy values to keep animation alive if possible, or re-raise
+                return collection, info_text, selected_cell_text
 
 
 

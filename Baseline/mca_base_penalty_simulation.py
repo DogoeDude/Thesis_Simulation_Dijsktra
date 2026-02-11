@@ -2,7 +2,7 @@
 MCA Evacuation Simulation
 Based on "Simulation method of urban evacuation based on mesoscopic cellular automata"
 """
-
+#Base with Penalty
 import geopandas as gpd
 import pandas as pd
 import numpy as np

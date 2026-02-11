@@ -61,6 +61,7 @@ class MCASimulation:
         self.history = []
         self.casualty_history = []
         self.per_cell_casualty_history = [] # LIST of DICTS: [ {cell_id: death_count}, ... ]
+        self.penalty_history = []           # LIST of DICTS: [ {cell_id: score}, ... ]
         
         # Exit Analysis
         self.exit_status = {} # exit_id -> 'OPEN'/'CLOSED'
@@ -556,6 +557,13 @@ class MCASimulation:
         self.per_cell_casualty_history = [] # RESET
         self.per_cell_casualty_history.append(self.casualties_per_cell.copy())
 
+        # Initial Penalties (Step 0)
+        p0 = {}
+        for cid in self.graph.nodes:
+            fire_val = self.penalties[cid]['fire']
+            p0[cid] = self.calculate_composite_score(cid, self.population[cid]/self.cell_areas.get(cid,60.0), fire_val)
+        self.penalty_history = [p0]
+
     def calculate_composite_score(self, cid, rho, fire_val):
         """
         Computes clamped composite penalty score for a cell.
@@ -715,7 +723,7 @@ class MCASimulation:
         self.time_step += 1
         return sum(self.population.values())
 
-    def export_to_excel(self, filename="simulation_results_base_2.xlsx"):
+    def export_to_excel(self, filename="simulation_results_base_2_penalty.xlsx"):
         print(f"Exporting results to {filename}...")
         
         # 1. Time Series Data (Step-by-Step)
@@ -851,6 +859,13 @@ class MCASimulation:
             self.casualty_history.append(self.casualties)
             self.per_cell_casualty_history.append(self.casualties_per_cell.copy())
             self.exit_usage_history.append(self.exit_usage.copy())
+
+            # Log Penalties
+            p_step = {}
+            for cid in self.graph.nodes:
+                fire_val = self.penalties[cid]['fire']
+                p_step[cid] = self.calculate_composite_score(cid, self.population[cid]/self.cell_areas.get(cid,60.0), fire_val)
+            self.penalty_history.append(p_step)
             
             if (t + 1) % 10 == 0:
                 curr_evac = sum(self.exit_usage.values())

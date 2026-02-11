@@ -1,0 +1,54 @@
+================================================================================
+                  SAFE ZONE VS BASELINE COMPARISON REPORT                       
+================================================================================
+CONFIGURATION: 500 Iterations | 4998 Agents | 300 Seconds Max
+================================================================================
+
+1. OVERALL PERFORMANCE METRICS (RSME / Efficiency)
+------------------------------------------------------------------------------------------------------------------------
+Metric                         | Baseline        | Base + Penalty  | Safe Zones      | Interpretation
+-----------------------------------------------------------------------------------------------------
+Avg Exit Flow Rate             | 13.94           | 8.60            | 13.62           | Higher is better (evacuation speed)
+Remaining Agents               | 262.65          | 713.05          | 223.46          | Lower is better (clearance)
+Total Evacuated                | 4329.00         | 2734.00         | 4239.00         | Higher is better
+Total Casualties               | 405.90          | 1549.89         | 534.58          | Lower is better (safety)
+
+Avg Density                    | 0.22            | 0.23            | 0.21            | Lower is better (congestion)
+Avg Velocity                   | 1.00            | 1.10            | 1.03            | Higher is better (mobility)
+Peak Density                   | 13.22           | 12.76           | 12.72           | Lower is better (crush risk)
+Total Time                     | 300.00          | 300.00          | 300.00          | Lower is better
+
+2. EXIT USAGE DISTRIBUTION (Load Balancing)
+--------------------------------------------------------------------------------
+Exit ID    | Baseline Usage  | Base + Penalty Usage | Safe Zones Usage
+----------------------------------------------------------------------
+0          | 3099.4          | 1514.1          | 3227.4          | 
+1          | 1229.6          | 1220.8          | 1012.5          | 
+2          | 0.0             | 0.0             | 0.0             | 
+
+3. SPATIAL DISTRIBUTION (Top 5 Casualty/Blockage Zones)
+--------------------------------------------------------------------------------
+--- Baseline Top Hazard Zones (Total Casualties: 405.90) ---
+Cell ID    | Casualties     
+88         | 384.54         
+81         | 10.18          
+82         | 6.37           
+203        | 4.99           
+67         | 0.13           
+
+--- Base + Penalty Top Hazard Zones (Total Casualties: 1549.89) ---
+Cell ID    | Casualties     
+88         | 866.46         
+81         | 519.65         
+78         | 64.46          
+85         | 25.16          
+67         | 20.01          
+
+--- Safe Zones Top Hazard Zones (Total Casualties: 534.58) ---
+Cell ID    | Casualties     
+88         | 530.33         
+203        | 4.68           
+82         | 0.04           
+81         | 0.04           
+6          | 0.00           
+

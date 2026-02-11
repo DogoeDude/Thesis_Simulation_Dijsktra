@@ -61,6 +61,7 @@ class MCASimulation:
         self.history = []
         self.casualty_history = []
         self.per_cell_casualty_history = [] # LIST of DICTS: [ {cell_id: death_count}, ... ]
+        self.penalty_history = []           # LIST of DICTS: [ {cell_id: score}, ... ]
         
         # Exit Analysis
         self.exit_status = {} # exit_id -> 'OPEN'/'CLOSED'
@@ -556,6 +557,13 @@ class MCASimulation:
         self.per_cell_casualty_history = [] # RESET
         self.per_cell_casualty_history.append(self.casualties_per_cell.copy())
 
+        # Initial Penalties (Step 0)
+        p0 = {}
+        for cid in self.graph.nodes:
+            fire_val = self.penalties[cid]['fire']
+            p0[cid] = self.calculate_composite_score(cid, self.population[cid]/self.cell_areas.get(cid,60.0), fire_val)
+        self.penalty_history = [p0]
+
     def calculate_composite_score(self, cid, rho, fire_val):
         """
         Computes clamped composite penalty score for a cell.
@@ -886,6 +894,13 @@ class MCASimulation:
             self.casualty_history.append(self.casualties)
             self.per_cell_casualty_history.append(self.casualties_per_cell.copy())
             self.exit_usage_history.append(self.exit_usage.copy())
+
+            # Log Penalties
+            p_step = {}
+            for cid in self.graph.nodes:
+                fire_val = self.penalties[cid]['fire']
+                p_step[cid] = self.calculate_composite_score(cid, self.population[cid]/self.cell_areas.get(cid,60.0), fire_val)
+            self.penalty_history.append(p_step)
             
             if (t + 1) % 10 == 0:
                 curr_evac = sum(self.exit_usage.values())
@@ -1112,7 +1127,7 @@ class MCASimulation:
                             centroids.plot(ax=ax, color='#ff00ff', marker='*', markersize=150, zorder=8, edgecolor='black', linewidth=1)
                             self.remaining_artist = ax.collections[-1] # valid reference
 
-            else:
+            elif self.view_mode == 'casualties':
                 # Casualty Mode (Dynamic Map of deaths up to this frame)
                 # Cleanup special artists if switching logic
                 if self.quiver: 
@@ -1132,9 +1147,23 @@ class MCASimulation:
                 deaths = [current_deaths.get(idx, 0) for idx in self.road_cells['id']]
                 collection.set_array(np.array(deaths))
                 collection.set_cmap('Reds')
-                # USER REQUEST: Any death = RED
-                # Clamp at 1.0. So 1 death = 1.0 (Max Red).
                 collection.set_clim(0, 1) 
+            
+            elif self.view_mode == 'penalties':
+                # Penalty Mode (Hazard Intensity)
+                if self.quiver: 
+                    self.quiver.remove()
+                    self.quiver = None
+                if self.remaining_artist:
+                    try: self.remaining_artist.remove()
+                    except: pass
+                    self.remaining_artist = None
+
+                p_data = self.penalty_history[frame]
+                scores = [p_data.get(idx, 0) for idx in self.road_cells['id']]
+                collection.set_array(np.array(scores))
+                collection.set_cmap('YlOrRd')
+                collection.set_clim(0, 1.0) 
 
             # 3. Counters
             current_agents = sum(pop_data.values())
@@ -1182,16 +1211,23 @@ class MCASimulation:
         def toggle_view(event):
             if self.view_mode == 'occupancy':
                 self.view_mode = 'casualties'
-                self.btn_casualty.label.set_text('Show Live Flow')
-                self.btn_casualty.color = 'lightblue'
-                self.btn_casualty.hovercolor = 'blue'
+                self.btn_casualty.label.set_text('Show Penalties')
+                self.btn_casualty.color = 'salmon'
+                self.btn_casualty.hovercolor = 'red'
                 ax.set_title("Total Casualties Heatmap (Any Red = >0 Deaths)", fontsize=14, fontweight='bold')
                 cbar.set_label('Total Casualties (Threshold = 1)')
+            elif self.view_mode == 'casualties':
+                self.view_mode = 'penalties'
+                self.btn_casualty.label.set_text('Show Live Flow')
+                self.btn_casualty.color = 'gold'
+                self.btn_casualty.hovercolor = 'orange'
+                ax.set_title("Hazard Penalty Map (Smoke/Fire Intensity)", fontsize=14, fontweight='bold')
+                cbar.set_label('Hazard Level (Composite Score 0.0 - 1.0)')
             else:
                 self.view_mode = 'occupancy'
                 self.btn_casualty.label.set_text('Show Casualties')
-                self.btn_casualty.color = 'salmon'
-                self.btn_casualty.hovercolor = 'red'
+                self.btn_casualty.color = 'lightblue'
+                self.btn_casualty.hovercolor = 'blue'
                 ax.set_title("USTP Evacuation (Per-Cell Capacity Analysis)", fontsize=14, fontweight='bold')
                 cbar.set_label('Occupancy Ratio (Population / Capacity)')
             

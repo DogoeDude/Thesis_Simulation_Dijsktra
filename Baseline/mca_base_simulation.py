@@ -298,33 +298,8 @@ class MCASimulation:
             # Assign fallback ID
             for i in ids: self.road_to_exit[i] = 999 
 
-        # SPECIAL HANDLING: Map CLOSED exits to nearest cell for counting/SDF
-        # as per user requirement (count evacuees even if "closed" visually)
-        for eid, status in self.exit_status.items():
-            if status == 'CLOSED':
-                exit_geom = self.exits.loc[eid].geometry
-                
-                # Find nearest road cell
-                min_dist = float('inf')
-                nearest_id = None
-                
-                # Iterate all road cells - could be slow, but safe
-                # Optimization: Use cell_centroids
-                for cid, pt in self.cell_centroids.items():
-                    d = pt.distance(exit_geom)
-                    if d < min_dist:
-                        min_dist = d
-                        nearest_id = cid
-                
-                if nearest_id is not None:
-                    # Treat as valid exit for SDF and Counting
-                    if nearest_id not in exit_indices:
-                        exit_indices.append(nearest_id)
-                    
-                    # Map for stats (Overwrites if multiple, but acceptable)
-                    self.road_to_exit[nearest_id] = eid
-                    
-                    print(f"DEBUG: Mapping CLOSED Exit {eid} to nearest cell {nearest_id} (Dist: {min_dist:.1f}m) for counting.")
+        # CLOSED exits are NOT added to exit_indices.
+        # Only genuinely OPEN exits (those intersecting road cells) act as sinks.
 
         # Static Distance Field (Euclidean)
         print("  - Calculating Static Distance Field (Euclidean)...")
@@ -390,6 +365,110 @@ class MCASimulation:
                 
         if local_minima_count > 0:
             print(f"  - WARNING: {local_minima_count} cells are in Local Minima (no neighbor is closer to exit). Flow may stop there.")
+
+        # Identify cells unreachable from any exit
+        self.unreachable_cells = set()
+        for nid in valid_nodes:
+            if nid not in exit_indices and self.directions.get(nid) is None:
+                if distances.get(nid, float('inf')) == float('inf'):
+                    self.unreachable_cells.add(nid)
+
+        if self.unreachable_cells:
+            print(f"  - WARNING: {len(self.unreachable_cells)} cells are UNREACHABLE from any exit: {sorted(self.unreachable_cells)}")
+            print(f"    Agents will NOT be spawned on these cells.")
+
+        # ---------------------------------------------------------
+        # 3. CONNECTIVITY REPAIR (Fixing Euclidean Dead Ends)
+        # ---------------------------------------------------------
+        # Euclidean distance often leads to dead ends (local minima) that are "close" to exits
+        # but topologically disconnected. We fix this by validating chains.
+
+        print("  - Validating flow connectivity...")
+        
+        # A. Identify Independent Valid Set (Nodes that actually reach an exit)
+        valid_flow_nodes = set(exit_indices)
+        
+        # Iterative propagation (reverse flow)
+        # We want to find all nodes u such that directions[u] -> ... -> exit
+        # Since we have N nodes, a loop is at most N steps. But efficient way is reverse graph.
+        
+        # Build reverse mapping: target -> [sources]
+        reverse_flow = {u: [] for u in valid_nodes}
+        for u, v in self.directions.items():
+            if v is not None:
+                if v not in reverse_flow: reverse_flow[v] = []
+                reverse_flow[v].append(u)
+        
+        # BFS from exits backwards
+        queue = list(exit_indices)
+        visited = set(exit_indices)
+        
+        import collections
+        q = collections.deque(exit_indices)
+        
+        while q:
+            curr = q.popleft()
+            # All nodes pointing TO curr are valid
+            sources = reverse_flow.get(curr, [])
+            for src in sources:
+                if src not in visited:
+                    visited.add(src)
+                    q.append(src)
+        
+        valid_flow_nodes = visited
+        stuck_nodes = [n for n in valid_nodes if n not in valid_flow_nodes]
+        
+        if stuck_nodes:
+            print(f"  - DETECTED {len(stuck_nodes)} STRANDED CELLS (Euclidean Local Minima). Repairing...")
+            
+            # B. Repair Plan: BFS from Valid Set to find nearest valid node
+            # This makes stuck agents flow towards the "Valid Network"
+            
+            # BFS for distance to valid network
+            # distance_to_valid[node] = hops
+            
+            # Initialize with valid set
+            q_repair = collections.deque(valid_flow_nodes)
+            dist_to_valid = {n: 0 for n in valid_flow_nodes}
+            
+            # Run BFS on the ROAD GRAPH (undirected)
+            while q_repair:
+                curr = q_repair.popleft()
+                current_dist = dist_to_valid[curr]
+                
+                for nbr in self.graph.neighbors(curr):
+                    if nbr not in dist_to_valid:
+                        dist_to_valid[nbr] = current_dist + 1
+                        q_repair.append(nbr)
+            
+            # C. Re-assign directions for stuck nodes
+            fixed_count = 0
+            for nid in stuck_nodes:
+                # Find neighbor with strictly smaller dist_to_valid
+                my_dist = dist_to_valid.get(nid, float('inf'))
+                best_fix = None
+                best_fix_dist = my_dist
+                
+                neighbors = list(self.graph.neighbors(nid))
+                # Sort by Euclidean distance as tie-breaker (preserve original logic preference)
+                neighbors.sort(key=lambda x: distances.get(x, float('inf')))
+                
+                for nbr in neighbors:
+                    d = dist_to_valid.get(nbr, float('inf'))
+                    if d < best_fix_dist:
+                        best_fix_dist = d
+                        best_fix = nbr
+                
+                if best_fix is not None:
+                    self.directions[nid] = best_fix
+                    fixed_count += 1
+                else:
+                    # Still stuck? Probably totally disconnected component
+                    self.directions[nid] = None
+            
+            print(f"  - REPAIRED {fixed_count} cells. Agents will now flow to validity.")
+        else:
+            print("  - Flow check passed. All cells have valid paths.")
         
         # Pre-calc flow vectors
         for idx, target_idx in self.directions.items():
@@ -418,7 +497,11 @@ class MCASimulation:
             spawn_buffer = self.spawns.buffer(5.0)
             for idx, cell in self.road_cells.iterrows():
                 if spawn_buffer.intersects(cell.geometry).any():
-                    source_ids.append(cell['id'])
+                    cid = cell['id']
+                    # Skip cells unreachable from exits
+                    if hasattr(self, 'unreachable_cells') and cid in self.unreachable_cells:
+                        continue
+                    source_ids.append(cid)
             
             if source_ids:
                 # Randomize distribution

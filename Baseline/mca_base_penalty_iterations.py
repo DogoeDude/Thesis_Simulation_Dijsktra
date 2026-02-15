@@ -561,7 +561,9 @@ class MCASimulation:
         p0 = {}
         for cid in self.graph.nodes:
             fire_val = self.penalties[cid]['fire']
-            p0[cid] = self.calculate_composite_score(cid, self.population[cid]/self.cell_areas.get(cid,60.0), fire_val)
+            area = self.cell_areas.get(cid, 60.0)
+            rho = self.population[cid] / area if area > 0 else 0.0
+            p0[cid] = self.calculate_composite_score(cid, rho, fire_val)
         self.penalty_history = [p0]
 
     def calculate_composite_score(self, cid, rho, fire_val):
@@ -648,7 +650,7 @@ class MCASimulation:
         if self.time_step > 10:
             for cid, count in self.population.items():
                 area = self.cell_areas.get(cid, 60.0)
-                rho = count / area if area > 0 else 0
+                rho = count / area if area > 0 else 0.0
                 
                 if rho > self.STAMPEDE_DENSITY:
                     deaths = count * self.DEATH_RATE
@@ -692,7 +694,7 @@ class MCASimulation:
             # Use MAX/PHYSICAL capacity for flow limit allows overcrowding
             cap = self.max_capacities.get(cid, 300.0)
             
-            rho_i = current_pop / area if area > 0 else 0
+            rho_i = current_pop / area if area > 0 else 0.0
             
             # HAZARD LOGIC (Penalty Slowdown)
             # Compute penalty score locally
@@ -750,7 +752,7 @@ class MCASimulation:
             for cid, count in pop_map.items():
                 if count > 0:
                     area = cell_params.get(cid, 60.0)
-                    rho = count / area
+                    rho = count / area if area > 0 else 0.0
                     
                     # Fundamental Diagram (Greenshields)
                     # v = v_free * (1 - rho/rho_max)
@@ -864,7 +866,9 @@ class MCASimulation:
             p_step = {}
             for cid in self.graph.nodes:
                 fire_val = self.penalties[cid]['fire']
-                p_step[cid] = self.calculate_composite_score(cid, self.population[cid]/self.cell_areas.get(cid,60.0), fire_val)
+                area = self.cell_areas.get(cid, 60.0)
+                rho = self.population[cid] / area if area > 0 else 0.0
+                p_step[cid] = self.calculate_composite_score(cid, rho, fire_val)
             self.penalty_history.append(p_step)
             
             if (t + 1) % 10 == 0:

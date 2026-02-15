@@ -1,0 +1,9 @@
+Starting imports...
+Imported os
+Set matplotlib backend to Agg
+Imported matplotlib.pyplot
+Imported pandas
+Traceback (most recent call last):
+  File "/home/reji/Desktop/Thesis_Simulation_Dijsktra/visualize_comparison_results.py", line 12, in <module>
+    import seaborn as sns
+ModuleNotFoundError: No module named 'seaborn'

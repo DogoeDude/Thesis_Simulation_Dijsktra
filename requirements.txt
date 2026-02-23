@@ -3,6 +3,7 @@ pandas
 numpy
 networkx
 matplotlib
+openpyxl
+seaborn
 shapely
 fiona
-openpyxl

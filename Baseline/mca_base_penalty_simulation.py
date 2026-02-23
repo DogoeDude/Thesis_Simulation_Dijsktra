@@ -113,16 +113,22 @@ class MCASimulation:
             for idx, row in self.road_cells.iterrows():
                 cell_id = row['id']
                 
-                # Area first (needed for fallback)
-                if 'cell_area' in row:
+                # Area calculation with fallback for non-polygons (LineStrings)
+                if 'cell_area' in row and float(row['cell_area']) > 0:
                     area = float(row['cell_area'])
-                    self.cell_areas[cell_id] = area
                 else:
                     area = row.geometry.area
-                    self.cell_areas[cell_id] = area
+                    # Logic for LineStrings (Area = 0 in shapely)
+                    if area <= 0 and hasattr(row.geometry, 'length'):
+                         area = row.geometry.length * self.CELL_WIDTH
+                    
+                    # Absolute Fallback (to prevent ZeroDivisionError later)
+                    if area <= 0: area = 60.0 # Default fallback area
+                
+                self.cell_areas[cell_id] = area
 
                 # SAFE Capacity (from GPKG)
-                if 'capacity' in row:
+                if 'capacity' in row and float(row['capacity']) > 0:
                     self.capacities[cell_id] = float(row['capacity'])
                 else:
                     self.capacities[cell_id] = area * 2.0 # Default safe density ~2 p/m2
@@ -130,7 +136,10 @@ class MCASimulation:
                 # PHYSICAL Capacity (Area * 5.0) - Allows overcrowding
                 self.max_capacities[cell_id] = area * self.RHO_MAX
 
-            print(f"Loaded {len(self.road_cells)} road cells. Max Capacity: {max(self.capacities.values())}")
+            if self.capacities:
+                print(f"Loaded {len(self.road_cells)} road cells. Max Capacity: {max(self.capacities.values()):.1f}")
+            else:
+                print(f"Loaded {len(self.road_cells)} road cells with no capacity data.")
             
             # Spawns (Building Exits)
             if 'building_exits' in layers:
@@ -561,7 +570,9 @@ class MCASimulation:
         p0 = {}
         for cid in self.graph.nodes:
             fire_val = self.penalties[cid]['fire']
-            p0[cid] = self.calculate_composite_score(cid, self.population[cid]/self.cell_areas.get(cid,60.0), fire_val)
+            area = self.cell_areas.get(cid, 60.0)
+            rho = self.population[cid] / area if area > 0 else 0
+            p0[cid] = self.calculate_composite_score(cid, rho, fire_val)
         self.penalty_history = [p0]
 
     def calculate_composite_score(self, cid, rho, fire_val):
@@ -850,31 +861,34 @@ class MCASimulation:
 
             with pd.ExcelWriter(filename, engine='openpyxl') as writer:
                 try:
-                    # Attempt to apply styles
+                    # Attempt to apply styles (requires jinja2)
                     df_time.style.apply(color_columns, axis=0).to_excel(writer, sheet_name='Time Metrics', index=False)
                     df_cells.sort_values(by='Spatial Distribution (Casualties)', ascending=False).style.apply(color_columns, axis=0).to_excel(writer, sheet_name='Spatial Distribution', index=False)
                     df_exits.style.apply(color_columns, axis=0).to_excel(writer, sheet_name='Exit Usage', index=False)
                     df_summary.style.apply(color_columns, axis=0).to_excel(writer, sheet_name='Summary', index=False)
-                    print(f"✅ Simulation results saved to {filename} (Colored)")
-                except ImportError:
-                    # Fallback if jinja2 missing
-                    print(f"⚠️ Styling failed (missing dependency). Saving unstyled version...")
+                    print(f"Simulation results saved to {filename} (Colored)")
+                except (ImportError, AttributeError):
+                    # Fallback if jinja2 missing or style attribute errors
+                    print(f"Styling failed or missing dependency. Saving unstyled version...")
                     df_time.to_excel(writer, sheet_name='Time Metrics', index=False)
                     df_cells.to_excel(writer, sheet_name='Spatial Distribution', index=False)
                     df_exits.to_excel(writer, sheet_name='Exit Usage', index=False)
                     df_summary.to_excel(writer, sheet_name='Summary', index=False)
-                    print(f"✅ Simulation results saved to {filename} (Unstyled)")
+                    print(f"Simulation results saved to {filename} (Unstyled)")
                 except Exception as e:
-                    # General fallback
-                    print(f"⚠️ Styling error: {e}. Saving unstyled version...")
-                    df_time.to_excel(writer, sheet_name='Time Metrics', index=False)
-                    df_cells.to_excel(writer, sheet_name='Spatial Distribution', index=False)
-                    df_exits.to_excel(writer, sheet_name='Exit Usage', index=False)
-                    df_summary.to_excel(writer, sheet_name='Summary', index=False)
-                    print(f"✅ Simulation results saved to {filename} (Unstyled)")
+                    # General fallback for other styling errors
+                    try:
+                        print(f"Styling error: {e}. Saving unstyled version...")
+                        df_time.to_excel(writer, sheet_name='Time Metrics', index=False)
+                        df_cells.to_excel(writer, sheet_name='Spatial Distribution', index=False)
+                        df_exits.to_excel(writer, sheet_name='Exit Usage', index=False)
+                        df_summary.to_excel(writer, sheet_name='Summary', index=False)
+                        print(f"Simulation results saved to {filename} (Unstyled)")
+                    except Exception as fallback_e:
+                        print(f"Critical error during fallback: {fallback_e}")
 
         except Exception as e:
-            print(f"❌ Failed to save Excel: {e}")
+            print(f"Failed to save Excel: {e}")
 
     def run(self, steps=100):
         print(f"Starting simulation for {steps} steps...")
@@ -899,7 +913,9 @@ class MCASimulation:
             p_step = {}
             for cid in self.graph.nodes:
                 fire_val = self.penalties[cid]['fire']
-                p_step[cid] = self.calculate_composite_score(cid, self.population[cid]/self.cell_areas.get(cid,60.0), fire_val)
+                area = self.cell_areas.get(cid, 60.0)
+                rho = self.population[cid] / area if area > 0 else 0
+                p_step[cid] = self.calculate_composite_score(cid, rho, fire_val)
             self.penalty_history.append(p_step)
             
             if (t + 1) % 10 == 0:

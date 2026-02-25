@@ -21,7 +21,6 @@ def index_py_files():
         import traceback
         print("Error writing index file:", e)
         traceback.print_exc()
-    import os
     print(f"File exists: {os.path.isfile(INDEX_FILE)}")
     print(f"Absolute path: {os.path.abspath(INDEX_FILE)}")
 

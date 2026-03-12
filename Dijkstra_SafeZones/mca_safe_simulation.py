@@ -974,19 +974,19 @@ class MCASimulation:
                 else:
                     # GROWTH PHASE
                     if p_dict['fire'] < 1.0:
-                        p_dict['fire'] = min(1.0, p_dict['fire'] + 0.03) # Moderate Growth (was 0.01)
+                        p_dict['fire'] = min(1.0, p_dict['fire'] + 0.04) # Moderate Growth
                     else:
                         # Reached Peak -> Start Burnout (Switch to Decay)
                         # Increased burnout chance to 10% (So it actually dies out)
                         if random.random() < 0.10: 
                              self.burnt_cells.add(cid)
                 
-                # ADJUSTED: Threshold 0.2, Chance 11% (User Requested)
-                if p_dict['fire'] > 0.4 and cid not in self.burnt_cells:
+                # ADJUSTED: Threshold 0.3, Chance 15% (User Requested Faster Spread)
+                if p_dict['fire'] > 0.3 and cid not in self.burnt_cells:
                     neighbors = list(self.graph.neighbors(cid))
                     for n in neighbors:
-                         # 11% chance to ignite neighbor
-                         if self.penalties[n]['fire'] == 0 and random.random() < 0.13:
+                         # 15% chance to ignite neighbor
+                         if self.penalties[n]['fire'] == 0 and random.random() < 0.15:
                              self.penalties[n]['fire'] = 0.1 # Start small
                              # Also add smoke
                              self.penalties[n]['smoke'] = 0.4
@@ -1291,8 +1291,11 @@ class MCASimulation:
                              current_step_flows[(cid, 'EXIT')] = current_step_flows.get((cid, 'EXIT'), 0) + actual_out
                      else:
                          # LOCAL MINIMUM -> Stuck
-                         # Agents remain here. do nothing.
-                         pass
+                         # Agents are permanently stranded here. Vaporize to prevent infinite loops.
+                         if current_pop > 0:
+                             self.garbage = getattr(self, 'garbage', 0.0) + current_pop
+                             self.exit_usage['STRANDED_CLEARED'] = self.exit_usage.get('STRANDED_CLEARED', 0) + current_pop
+                             new_population[cid] = 0.0
                 continue
             
             # Flow Calculation
@@ -1352,11 +1355,12 @@ class MCASimulation:
 
         self.population = new_population
         
-        # Population Hygiene (Remove Ghosts)
+        # Population Hygiene (Remove Ghosts aggressively)
         for cid in list(self.population.keys()):
-            if self.population[cid] < 0.05:
+            if self.population[cid] < 0.5:
                 removed_amount = self.population[cid]
                 self.garbage += removed_amount
+                self.exit_usage['GHOSTS_CLEARED'] = self.exit_usage.get('GHOSTS_CLEARED', 0) + removed_amount
                 self.population[cid] = 0.0
 
         self.flow_history.append(current_step_flows)
@@ -1558,6 +1562,9 @@ class MCASimulation:
         initial_evac = sum(self.exit_usage.values())
         print(f"Step 0 (Start): Agents: {initial_pop:.0f} | Evacuated: {initial_evac:.0f} | Dead: {self.casualties:.0f}")
 
+        idle_counter = 0
+        last_evac_cas_sum = -1
+
         for t in range(steps):
             # INJECT HAZARD (RANDOMIZED)
             if t == fire_start_time:
@@ -1572,6 +1579,21 @@ class MCASimulation:
             self.per_cell_casualty_history.append(self.casualties_per_cell.copy())
             self.exit_usage_history.append(self.exit_usage.copy())
             
+            curr_evac = sum(self.exit_usage.values())
+            
+            # EARLY STOPPING LOGIC: If total evacuees and casualties haven't changed, agents are stuck
+            current_evac_cas_sum = curr_evac + self.casualties
+            if abs(current_evac_cas_sum - last_evac_cas_sum) < 0.01:
+                idle_counter += 1
+            else:
+                idle_counter = 0
+            
+            if idle_counter >= 40 and total > 0:
+                print(f"Ending early at step {t+1} due to simulation standstill (stuck agents).")
+                break
+                
+            last_evac_cas_sum = current_evac_cas_sum
+
             # ERA: Record Dynamic Fields
             # 1. Penalties (HAZARD ONLY for Viz - Exclude Density)
             current_penalties = {}
@@ -1588,7 +1610,6 @@ class MCASimulation:
             self.distance_history.append(self.dijkstra_distances.copy())
             
             if (t + 1) % 10 == 0:
-                curr_evac = sum(self.exit_usage.values())
                 print(f"Step {t+1}: Agents: {total:.0f} | Evacuated: {curr_evac:.0f} | Dead: {self.casualties:.0f}")
             if total < 1:
                 break
@@ -1620,9 +1641,8 @@ class MCASimulation:
         print(f"  Remaining:     {total_remaining:.0f}")
         print(f"  Evacuated:     {total_evacuated:.0f}")
         print(f"  Dead:          {total_dead:.0f}")
-        print(f"  Ghost Cleaned: {self.garbage:.2f}")
         
-        final_total = total_remaining + total_evacuated + total_dead + self.garbage
+        final_total = total_remaining + total_evacuated + total_dead
         print(f"  Calculated Sum:{final_total:.0f}")
         print(f"  DISCREPANCY:   {self.total_agents_init - final_total:.2f}")
         
@@ -1675,7 +1695,9 @@ class MCASimulation:
              # Match Dijkstra Pure Style: Solid Blue, zorder=5
              self.spawns.plot(ax=ax, color='blue', marker='o', markersize=30, label='Spawn Points', zorder=5)
         if self.safe_zones is not None:
-             self.safe_zones.plot(ax=ax, color='lime', marker='*', markersize=150, edgecolor='black', linewidth=1, label='Safe Zones', zorder=9)
+             # User requested to hide the visual green stars for safe zones
+             pass
+             # self.safe_zones.plot(ax=ax, color='lime', marker='*', markersize=150, edgecolor='black', linewidth=1, label='Safe Zones', zorder=9)
         if self.exits is not None:
              self.exits.plot(ax=ax, color='red', marker='X', markersize=150, edgecolor='black', linewidth=2, label='Exits', zorder=10)
         

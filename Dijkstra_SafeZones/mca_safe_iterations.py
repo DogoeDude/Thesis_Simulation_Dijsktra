@@ -758,6 +758,8 @@ class MCASimulation:
         
         self.per_cell_casualty_history = [] # RESET
         self.per_cell_casualty_history.append(self.casualties_per_cell.copy())
+        
+        self.garbage = 0.0
 
 
 
@@ -817,19 +819,19 @@ class MCASimulation:
                 else:
                     # GROWTH PHASE
                     if p_dict['fire'] < 1.0:
-                        p_dict['fire'] = min(1.0, p_dict['fire'] + 0.01) # Slower Growth (was 0.05)
+                        p_dict['fire'] = min(1.0, p_dict['fire'] + 0.04) # Moderate Growth
                     else:
                         # Reached Peak -> Start Burnout (Switch to Decay)
                         # Increased burnout chance to 10% (So it actually dies out)
                         if random.random() < 0.10: 
                              self.burnt_cells.add(cid)
                 
-                # ADJUSTED: Threshold 0.2, Chance 5% (Very Slow Spread, contained)
+                # ADJUSTED: Threshold 0.2, Chance 10% (User Requested Faster Spread)
                 if p_dict['fire'] > 0.2 and cid not in self.burnt_cells:
                     neighbors = list(self.graph.neighbors(cid))
                     for n in neighbors:
-                         # 5% chance to ignite neighbor (reliable spread, but slow growth)
-                         if self.penalties[n]['fire'] == 0 and random.random() < 0.05:
+                         # 10% chance to ignite neighbor
+                         if self.penalties[n]['fire'] == 0 and random.random() < 0.10:
                              self.penalties[n]['fire'] = 0.1 # Start VERY small (needs ~10 steps to become dangerous)
                              # Also add smoke
                              self.penalties[n]['smoke'] = 0.6
@@ -1020,8 +1022,11 @@ class MCASimulation:
                          step_exit_flow[exit_id] = step_exit_flow.get(exit_id, 0) + actual_out
                      else:
                          # LOCAL MINIMUM -> Stuck
-                         # Agents remain here. do nothing.
-                         pass
+                         # Agents are permanently stranded here. Vaporize to prevent infinite loops.
+                         if current_pop > 0:
+                             self.garbage = getattr(self, 'garbage', 0.0) + current_pop
+                             self.exit_usage['STRANDED_CLEARED'] = self.exit_usage.get('STRANDED_CLEARED', 0) + current_pop
+                             new_population[cid] = 0.0
                 continue
             
             # Flow Calculation
@@ -1053,6 +1058,15 @@ class MCASimulation:
             self.exit_usage[eid] += count
             
         self.population = new_population
+        
+        # Population Hygiene (Remove Ghosts & Micro-fractions aggressively)
+        for cid in list(self.population.keys()):
+            if self.population[cid] < 0.5:
+                removed_amount = self.population[cid]
+                self.garbage = getattr(self, 'garbage', 0.0) + removed_amount
+                self.exit_usage['GHOSTS_CLEARED'] = self.exit_usage.get('GHOSTS_CLEARED', 0) + removed_amount
+                self.population[cid] = 0.0
+
         self.time_step += 1
         return sum(self.population.values())
 
@@ -1086,6 +1100,9 @@ class MCASimulation:
         initial_evac = sum(self.exit_usage.values())
         print(f"Step 0 (Start): Agents: {initial_pop:.0f} | Evacuated: {initial_evac:.0f} | Dead: {self.casualties:.0f}")
 
+        idle_counter = 0
+        last_evac_cas_sum = -1
+
         for t in range(steps):
             # INJECT HAZARD (RANDOMIZED)
             if t == fire_start_time:
@@ -1100,8 +1117,22 @@ class MCASimulation:
             self.per_cell_casualty_history.append(self.casualties_per_cell.copy())
             self.exit_usage_history.append(self.exit_usage.copy())
             
+            curr_evac = sum(self.exit_usage.values())
+            
+            # EARLY STOPPING LOGIC
+            current_evac_cas_sum = curr_evac + self.casualties
+            if abs(current_evac_cas_sum - last_evac_cas_sum) < 0.01:
+                idle_counter += 1
+            else:
+                idle_counter = 0
+            
+            if idle_counter >= 30 and total > 0:
+                print(f"Ending early at step {t+1} due to simulation standstill (stuck agents).")
+                break
+                
+            last_evac_cas_sum = current_evac_cas_sum
+            
             if (t + 1) % 10 == 0:
-                curr_evac = sum(self.exit_usage.values())
                 print(f"Step {t+1}: Agents: {total:.0f} | Evacuated: {curr_evac:.0f} | Dead: {self.casualties:.0f}")
             if total < 1:
                 break

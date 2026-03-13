@@ -57,7 +57,6 @@ def generate_raw_bar_chart():
         ('Peak Density (p/m2)',        'Peak Density',       'p/m²',          True),
         ('Avg Exit Flow Rate',         'Exit Flow Rate',     'agents/step',   False),
         ('Avg Velocity (m/s)',         'Avg Velocity',       'm/s',           False),
-        ('Remaining Agents',           'Remaining Agents',   'agents',        True),
     ]
     
     actual_configs = [(m, lbl, unit, inv) for (m, lbl, unit, inv) in metrics_config if m in df_compare.columns]

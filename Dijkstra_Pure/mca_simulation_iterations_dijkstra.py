@@ -726,7 +726,7 @@ def get_config_from_terminal():
     
     # Defaults
     d_agents = 5000
-    d_steps = 300
+    d_steps = 500
     d_iters = 5
     
     try:
@@ -838,6 +838,7 @@ def main():
     
     # Calculate Average of Runs
     avg_row = df_runs.mean(numeric_only=True)
+    avg_row = avg_row.astype(object)
     avg_row['Run'] = 'AVERAGE' 
     # Cast integers for logic
     avg_row['Total Casualties'] = avg_row['Total Casualties']

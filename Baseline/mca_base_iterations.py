@@ -1240,7 +1240,7 @@ def get_config_from_terminal():
     
     # Defaults
     d_agents = 5000
-    d_steps = 300
+    d_steps = 500
     d_iters = 5
     
     # Try parsing CLI args first

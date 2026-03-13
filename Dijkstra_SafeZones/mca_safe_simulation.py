@@ -1357,7 +1357,7 @@ class MCASimulation:
         
         # Population Hygiene (Remove Ghosts aggressively)
         for cid in list(self.population.keys()):
-            if self.population[cid] < 0.8:
+            if self.population[cid] < 0.6:
                 removed_amount = self.population[cid]
                 self.garbage += removed_amount
                 self.exit_usage['GHOSTS_CLEARED'] = self.exit_usage.get('GHOSTS_CLEARED', 0) + removed_amount

@@ -53,7 +53,7 @@ class MCASimulation:
         
         # Stampede Logic
         self.STAMPEDE_DENSITY = 3.5 # p/m^2 (Lowered from 4.0) (Lowered from 4.5 to increase sensitivity)
-        self.DEATH_RATE = 0.03 # 3% per second if overcrowded
+        self.DEATH_RATE = 0.03 # 5% per second if overcrowded
         
         # State
         self.population = {} # cell_index -> count

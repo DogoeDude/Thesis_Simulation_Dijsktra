@@ -1,1 +1,1 @@
-map = "gusa-map.gpkg"
+map = "ustp-new-map.gpkg"

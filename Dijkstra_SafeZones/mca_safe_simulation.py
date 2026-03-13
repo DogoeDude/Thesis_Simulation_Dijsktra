@@ -1357,7 +1357,7 @@ class MCASimulation:
         
         # Population Hygiene (Remove Ghosts aggressively)
         for cid in list(self.population.keys()):
-            if self.population[cid] < 0.5:
+            if self.population[cid] < 0.8:
                 removed_amount = self.population[cid]
                 self.garbage += removed_amount
                 self.exit_usage['GHOSTS_CLEARED'] = self.exit_usage.get('GHOSTS_CLEARED', 0) + removed_amount
@@ -1613,6 +1613,16 @@ class MCASimulation:
                 print(f"Step {t+1}: Agents: {total:.0f} | Evacuated: {curr_evac:.0f} | Dead: {self.casualties:.0f}")
             if total < 1:
                 break
+        
+        # FINAL SWEEP: Evacuate the last remaining 1-2 ghost agents
+        total_remaining = sum(self.population.values())
+        if 0 < total_remaining <= 2.5:
+            for cid in self.population:
+                if self.population[cid] > 0:
+                    self.exit_usage['GHOSTS_CLEARED'] = self.exit_usage.get('GHOSTS_CLEARED', 0) + self.population[cid]
+                    self.population[cid] = 0.0
+            self.history[-1] = self.population.copy()
+            self.exit_usage_history[-1] = self.exit_usage.copy()
         
         print("\n" + "="*40)
         print(f"=== CASUALTY REPORT (Total: {self.casualties:.1f}) ===")

@@ -53,7 +53,7 @@ class MCASimulation:
         
         # Stampede Logic
         self.STAMPEDE_DENSITY = 3.5 # p/m^2 (Lowered from 4.0) (Lowered from 4.5 to increase sensitivity)
-        self.DEATH_RATE = 0.1 # 10% per second if overcrowded
+        self.DEATH_RATE = 0.03 # 3% per second if overcrowded
         
         # State
         self.population = {} # cell_index -> count
@@ -1061,7 +1061,7 @@ class MCASimulation:
         
         # Population Hygiene (Remove Ghosts & Micro-fractions aggressively)
         for cid in list(self.population.keys()):
-            if self.population[cid] < 0.5:
+            if self.population[cid] < 0.8:
                 removed_amount = self.population[cid]
                 self.garbage = getattr(self, 'garbage', 0.0) + removed_amount
                 self.exit_usage['GHOSTS_CLEARED'] = self.exit_usage.get('GHOSTS_CLEARED', 0) + removed_amount
@@ -1266,7 +1266,7 @@ def get_config_from_terminal():
     
     # Defaults
     d_agents = 5000
-    d_steps = 300
+    d_steps = 500
     d_iters = 5
     
     # Try parsing CLI args first
@@ -1371,7 +1371,7 @@ def main():
             'Total Casualties': total_casualties,
             'Total Evacuated': int(total_evacuated),
             'Remaining Agents': remaining_agents,
-            'Total Evacuation Time (s)': float(total_time)
+            'Total Evacuation Time (s)': float(f"{total_time:.2f}")
         })
         
         # Store for global averaging

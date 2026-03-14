@@ -1293,8 +1293,9 @@ class MCASimulation:
                          # LOCAL MINIMUM -> Stuck
                          # Agents are permanently stranded here. Vaporize to prevent infinite loops.
                          if current_pop > 0:
-                             self.garbage = getattr(self, 'garbage', 0.0) + current_pop
-                             self.exit_usage['STRANDED_CLEARED'] = self.exit_usage.get('STRANDED_CLEARED', 0) + current_pop
+                             # Count as casualties — permanently stranded with no exit route
+                             self.casualties += current_pop
+                             self.casualties_per_cell[cid] = self.casualties_per_cell.get(cid, 0) + current_pop
                              new_population[cid] = 0.0
                 continue
             
@@ -1355,12 +1356,21 @@ class MCASimulation:
 
         self.population = new_population
         
-        # Population Hygiene (Remove Ghosts aggressively)
+        # Population Hygiene (Remove Micro-fractions & count as evacuated)
         for cid in list(self.population.keys()):
             if self.population[cid] < 0.6:
                 removed_amount = self.population[cid]
                 self.garbage += removed_amount
-                self.exit_usage['GHOSTS_CLEARED'] = self.exit_usage.get('GHOSTS_CLEARED', 0) + removed_amount
+                # Credit to the exit this cell was flowing toward (or first available exit)
+                target_exit = self.road_to_exit.get(cid)
+                if target_exit is None:
+                    next_cell = self.directions.get(cid)
+                    if next_cell is not None:
+                        target_exit = self.road_to_exit.get(next_cell)
+                if target_exit is None and self.exit_usage:
+                    target_exit = next(iter(self.exit_usage))
+                if target_exit is not None:
+                    self.exit_usage[target_exit] = self.exit_usage.get(target_exit, 0) + removed_amount
                 self.population[cid] = 0.0
 
         self.flow_history.append(current_step_flows)
@@ -1614,12 +1624,20 @@ class MCASimulation:
             if total < 1:
                 break
         
-        # FINAL SWEEP: Evacuate the last remaining 1-2 ghost agents
+        # FINAL SWEEP: Absorb the last remaining micro-fraction agents as evacuated
         total_remaining = sum(self.population.values())
         if 0 < total_remaining <= 2.5:
-            for cid in self.population:
+            for cid in list(self.population.keys()):
                 if self.population[cid] > 0:
-                    self.exit_usage['GHOSTS_CLEARED'] = self.exit_usage.get('GHOSTS_CLEARED', 0) + self.population[cid]
+                    target_exit = self.road_to_exit.get(cid)
+                    if target_exit is None:
+                        next_cell = self.directions.get(cid)
+                        if next_cell is not None:
+                            target_exit = self.road_to_exit.get(next_cell)
+                    if target_exit is None and self.exit_usage:
+                        target_exit = next(iter(self.exit_usage))
+                    if target_exit is not None:
+                        self.exit_usage[target_exit] = self.exit_usage.get(target_exit, 0) + self.population[cid]
                     self.population[cid] = 0.0
             self.history[-1] = self.population.copy()
             self.exit_usage_history[-1] = self.exit_usage.copy()

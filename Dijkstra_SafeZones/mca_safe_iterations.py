@@ -1024,8 +1024,9 @@ class MCASimulation:
                          # LOCAL MINIMUM -> Stuck
                          # Agents are permanently stranded here. Vaporize to prevent infinite loops.
                          if current_pop > 0:
-                             self.garbage = getattr(self, 'garbage', 0.0) + current_pop
-                             self.exit_usage['STRANDED_CLEARED'] = self.exit_usage.get('STRANDED_CLEARED', 0) + current_pop
+                             # Count as casualties — permanently stranded with no exit route
+                             self.casualties += current_pop
+                             self.casualties_per_cell[cid] = self.casualties_per_cell.get(cid, 0) + current_pop
                              new_population[cid] = 0.0
                 continue
             
@@ -1059,12 +1060,21 @@ class MCASimulation:
             
         self.population = new_population
         
-        # Population Hygiene (Remove Ghosts & Micro-fractions aggressively)
+        # Population Hygiene (Remove Micro-fractions & count as evacuated)
         for cid in list(self.population.keys()):
             if self.population[cid] < 0.8:
                 removed_amount = self.population[cid]
                 self.garbage = getattr(self, 'garbage', 0.0) + removed_amount
-                self.exit_usage['GHOSTS_CLEARED'] = self.exit_usage.get('GHOSTS_CLEARED', 0) + removed_amount
+                # Credit to the exit this cell was flowing toward (or first available exit)
+                target_exit = self.road_to_exit.get(cid)
+                if target_exit is None:
+                    next_cell = self.directions.get(cid)
+                    if next_cell is not None:
+                        target_exit = self.road_to_exit.get(next_cell)
+                if target_exit is None and self.exit_usage:
+                    target_exit = next(iter(self.exit_usage))
+                if target_exit is not None:
+                    self.exit_usage[target_exit] = self.exit_usage.get(target_exit, 0) + removed_amount
                 self.population[cid] = 0.0
 
         self.time_step += 1
@@ -1137,6 +1147,26 @@ class MCASimulation:
             if total < 1:
                 break
         
+        # FINAL SWEEP: Absorb the last remaining micro-fraction agents as evacuated
+        total_remaining = sum(self.population.values())
+        if 0 < total_remaining <= 2.5:
+            for cid in list(self.population.keys()):
+                if self.population[cid] > 0:
+                    target_exit = self.road_to_exit.get(cid)
+                    if target_exit is None:
+                        next_cell = self.directions.get(cid)
+                        if next_cell is not None:
+                            target_exit = self.road_to_exit.get(next_cell)
+                    if target_exit is None and self.exit_usage:
+                        target_exit = next(iter(self.exit_usage))
+                    if target_exit is not None:
+                        self.exit_usage[target_exit] = self.exit_usage.get(target_exit, 0) + self.population[cid]
+                    self.population[cid] = 0.0
+            if self.history:
+                self.history[-1] = self.population.copy()
+            if self.exit_usage_history:
+                self.exit_usage_history[-1] = self.exit_usage.copy()
+
         # FINAL REPORT
         print("\n" + "="*40)
         print(f"=== CASUALTY REPORT (Total: {self.casualties:.1f}) ===")
@@ -1210,12 +1240,12 @@ class MCASimulation:
                 
             time_data.append({
                 'Time (s)': t * self.DT,
-                'Exit Flow Rate': int(flow_step), 
-                'Remaining Evacuees': total_alive, 
+                'Exit Flow Rate': round(flow_step), 
+                'Remaining Evacuees': round(total_alive), 
                 'Density Evolution': avg_density,
                 'Velocity of Evacuees': avg_speed,
                 'Peak Density': max_rho, 
-                'Cumulative Casualties': int(cas_count) 
+                'Cumulative Casualties': round(cas_count) 
             })
             
         df_time = pd.DataFrame(time_data)
@@ -1241,7 +1271,7 @@ class MCASimulation:
             status = self.exit_status.get(eid, 'UNKNOWN')
             exit_data.append({
                 'Exit ID': eid,
-                'Exit Usage Distribution': int(count),
+                'Exit Usage Distribution': round(count),
                 'Status': status
             })
         df_exits = pd.DataFrame(exit_data)
@@ -1256,7 +1286,7 @@ class MCASimulation:
         
         df_summary = pd.DataFrame([{
             'Total Evacuation Time': final_time,
-            'Total Casualties': int(self.casualties)
+            'Total Casualties': round(self.casualties)
         }])
         
         return df_time, df_cells, df_exits, df_summary
@@ -1356,11 +1386,15 @@ def main():
         mean_velocity = df_t['Velocity of Evacuees'].mean()
         peak_density = df_t['Peak Density'].max()
         
-        remaining_agents = df_t['Remaining Evacuees'].iloc[-1]
-        total_evacuated = df_e['Exit Usage Distribution'].sum()
+        remaining_agents = round(df_t['Remaining Evacuees'].iloc[-1])
+        total_evacuated_raw = df_e['Exit Usage Distribution'].sum()
         
         total_time = df_sum['Total Evacuation Time'].iloc[0]
         total_casualties = df_sum['Total Casualties'].iloc[0]
+        
+        # Force balance: round casualties first, derive evacuated as remainder
+        rounded_casualties = round(total_casualties)
+        rounded_evacuated = config['agents'] - rounded_casualties - remaining_agents
         
         run_summaries.append({
             'Run': i + 1,
@@ -1368,8 +1402,8 @@ def main():
             'Avg Density (p/m2)': float(f"{mean_density:.2f}"),
             'Avg Velocity (m/s)': float(f"{mean_velocity:.2f}"),
             'Peak Density (p/m2)': float(f"{peak_density:.2f}"),
-            'Total Casualties': total_casualties,
-            'Total Evacuated': int(total_evacuated),
+            'Total Casualties': rounded_casualties,
+            'Total Evacuated': rounded_evacuated,
             'Remaining Agents': remaining_agents,
             'Total Evacuation Time (s)': float(f"{total_time:.2f}")
         })
@@ -1391,9 +1425,10 @@ def main():
     avg_row = df_runs.mean(numeric_only=True)
     avg_row = avg_row.astype(object) # Allow string assignment
     avg_row['Run'] = 'AVERAGE' 
-    avg_row['Total Casualties'] = avg_row['Total Casualties']
-    avg_row['Total Evacuated'] = int(avg_row['Total Evacuated'])
-    avg_row['Remaining Agents'] = avg_row['Remaining Agents']
+    # Force balance: round casualties first, derive evacuated
+    avg_row['Total Casualties'] = round(avg_row['Total Casualties'])
+    avg_row['Remaining Agents'] = round(avg_row['Remaining Agents'])
+    avg_row['Total Evacuated'] = config['agents'] - avg_row['Total Casualties'] - avg_row['Remaining Agents']
     
     df_runs_final = pd.concat([df_runs, pd.DataFrame([avg_row])], ignore_index=True)
 

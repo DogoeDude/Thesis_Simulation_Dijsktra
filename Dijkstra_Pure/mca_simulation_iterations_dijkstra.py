@@ -53,7 +53,7 @@ class MCASimulation:
         
         # Stampede Logic
         self.STAMPEDE_DENSITY = 3.5 # p/m^2 (Lowered from 4.5 to increase sensitivity)
-        self.DEATH_RATE = 0.1 # 10% per second if overcrowded
+        self.DEATH_RATE = 0.05 # 5% per second if overcrowded
         
         # State
         self.population = {} # cell_index -> count
@@ -393,8 +393,11 @@ class MCASimulation:
                          self.exit_usage[exit_id] += actual_out
                      else:
                          # LOCAL MINIMUM -> Stuck
-                         # Agents remain here. do nothing.
-                         pass
+                         # Agents are permanently stranded here with no valid exit route.
+                         if current_pop > 0:
+                             self.casualties += current_pop
+                             self.casualties_per_cell[cid] = self.casualties_per_cell.get(cid, 0) + current_pop
+                             new_population[cid] = 0.0
                 continue
             
             # Flow Calculation
